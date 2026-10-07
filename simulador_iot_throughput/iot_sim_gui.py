@@ -59,6 +59,31 @@ class Database:
         self.conexao.commit()
 
 
+class Sincronizador:
+    def __init__(self, modo="mutex", n_semaf = 1):
+        self.modo = modo
+
+        if modo == "mutex":
+            self.recurso = threading.Lock()
+
+        elif modo == "semaforo":
+            self.recurso = threading.Semaphore(n_semaf)
+
+        elif modo == "nenhum":
+            self.recurso = None
+
+        else:
+            raise ValueError("Modo de sincronização inválido.")
+
+    def adquirir(self):
+        if self.recurso is not None:
+            self.recurso.acquire()
+
+    def liberar(self):
+        if self.recurso is not None:
+            self.recurso.release()
+
+
 class IotSensor:
     def __init__(self, sensor_id):
         self.sensor_id = sensor_id
