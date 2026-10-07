@@ -30,37 +30,50 @@ class Configuracao:
 
 class Database:
     def __init__(self):
-        self.conexao = sqlite3.connect('leituras_sensores.db')
-        self.conexao.execute("""
-        CREATE TABLE IF NOT EXISTS leituras (
-        leitura_id INTEGER PRIMARY KEY AUTOINCREMENT,
-        sensor_id INTEGER NOT NULL,
-        temperatura REAL NOT NULL,
-        horario REAL NOT NULL,
-        status TEXT NOT NULL,
-        prioridade INTEGER NOT NULL)
-        """)
-        self.conexao.commit()
-        self.conexao.close()
+        conexao = sqlite3.connect("leituras_sensores.db")
 
+        conexao.execute("""
+        CREATE TABLE IF NOT EXISTS leituras (
+            leitura_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sensor_id INTEGER NOT NULL,
+            temperatura REAL NOT NULL,
+            horario REAL NOT NULL,
+            status TEXT NOT NULL,
+            prioridade INTEGER NOT NULL
+        )
+        """)
+
+        conexao.commit()
+        conexao.close()
 
     def gravacao(self, leitura):
-        self.conexao.execute("""
-        INSERT INTO leituras(
-        sensor_id,
-        temperatura, 
-        horario,
-        status,
-        prioridade)
-        VALUES (?, ?, ?, ?, ?)
-        """, (leitura["sensor_id"],
-        leitura["temperatura"],
-        leitura["horario"],
-        "pendente",
-        leitura["prioridade"]))
 
-        self.conexao.commit()
-        self.conexao.close()
+        conexao = sqlite3.connect("leituras_sensores.db")
+
+        print(
+            f"[{threading.current_thread().name}] "
+            f"gravando leitura do sensor {leitura['sensor_id']}"
+        )
+
+        conexao.execute("""
+        INSERT INTO leituras (
+            sensor_id,
+            temperatura,
+            horario,
+            status,
+            prioridade
+        )
+        VALUES (?, ?, ?, ?, ?)
+        """, (
+            leitura["sensor_id"],
+            leitura["temperatura"],
+            leitura["horario"],
+            "pendente",
+            leitura["prioridade"]
+        ))
+
+        conexao.commit()
+        conexao.close()
 
 
 class Sincronizador:
@@ -81,7 +94,15 @@ class Sincronizador:
 
     def adquirir(self):
         if self.recurso is not None:
+            print(
+            f"[{threading.current_thread().name}] "
+            f"tentando acessar o banco"
+            )
             self.recurso.acquire()
+            print(
+            f"[{threading.current_thread().name}] "
+            f"entrou na seção crítica"
+            )
 
     def liberar(self):
         if self.recurso is not None:
