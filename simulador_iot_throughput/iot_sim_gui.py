@@ -25,6 +25,8 @@ class Configuracao:
     num_servidores: int
     threads_por_servidor: int
 
+    #modo_sincronizador: str   # ARRUMAR AQ PRA INTERFACE PERMITIR ESCOLHER O MODO
+
 
 class Database:
     def __init__(self):
@@ -39,6 +41,7 @@ class Database:
         prioridade INTEGER NOT NULL)
         """)
         self.conexao.commit()
+        self.conexao.close()
 
 
     def gravacao(self, leitura):
@@ -57,6 +60,7 @@ class Database:
         leitura["prioridade"]))
 
         self.conexao.commit()
+        self.conexao.close()
 
 
 class Sincronizador:
@@ -98,7 +102,7 @@ class IotSensor:
             "prioridade": random.randint(1,3)
         }
 
-    def leitura(self, fila, quantidade, intervalo, stop_event):
+    def leitura(self, quantidade, intervalo, stop_event):
         for indice in range(quantidade):
             if stop_event.is_set():
                 break
@@ -182,6 +186,9 @@ def executar_simulacao(config, stop_event=None, guardar_leituras=True):
         stop_event = threading.Event()
 
     fila = Queue()
+    banco = Database()
+    sincronizador = Sincronizador(modo="mutex")
+    
     coletor = ColetorResultados(guardar_leituras=guardar_leituras)
 
     total_esperado = config.num_sensores * config.leituras_por_sensor
@@ -209,7 +216,7 @@ def executar_simulacao(config, stop_event=None, guardar_leituras=True):
             )
             threads_servidores.append(thread)
 
-    sensores = [IotSensor(i) for i in range(config.num_sensores)]
+    sensores = [IotSensor(i,banco,sincronizador)for i in range(config.num_sensores)]
     threads_sensores = []
 
     for sensor in sensores:
@@ -222,7 +229,6 @@ def executar_simulacao(config, stop_event=None, guardar_leituras=True):
             thread = threading.Thread(
                 target=sensor.leitura,
                 args=(
-                    fila,
                     quantidade,
                     config.intervalo_leituras,
                     stop_event,
