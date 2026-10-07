@@ -85,14 +85,17 @@ class Sincronizador:
 
 
 class IotSensor:
-    def __init__(self, sensor_id):
+    def __init__(self, sensor_id,banco,sincronizador):
         self.sensor_id = sensor_id
+        self.banco = banco
+        self.sincronizador = sincronizador
 
     def gera_medida(self):
         return {
             "sensor_id": self.sensor_id,
             "temperatura": random.uniform(15, 35),
             "horario": time.time(),
+            "prioridade": random.randint(1,3)
         }
 
     def leitura(self, fila, quantidade, intervalo, stop_event):
@@ -100,7 +103,12 @@ class IotSensor:
             if stop_event.is_set():
                 break
 
-            fila.put(self.gera_medida())
+            leitura = self.gera_medida()
+            self.sincronizador.adquirir()
+            try:
+                self.banco.gravacao(leitura)
+            finally:
+                self.sincronizador.liberar()
 
             if stop_event.wait(intervalo):
                 break
