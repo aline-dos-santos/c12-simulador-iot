@@ -11,6 +11,8 @@ from tkinter import ttk, messagebox
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
+import sqlite3
+
 SENTINELA = object()
 
 @dataclass
@@ -22,6 +24,39 @@ class Configuracao:
     tempo_processamento: float
     num_servidores: int
     threads_por_servidor: int
+
+
+class Database:
+    def __init__(self):
+        self.conexao = sqlite3.connect('leituras_sensores.db')
+        self.conexao.execute("""
+        CREATE TABLE IF NOT EXISTS leituras (
+        leitura_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        sensor_id INTEGER NOT NULL,
+        temperatura REAL NOT NULL,
+        horario REAL NOT NULL,
+        status TEXT NOT NULL,
+        prioridade INTEGER NOT NULL)
+        """)
+        self.conexao.commit()
+
+
+    def gravacao(self, leitura):
+        self.conexao.execute("""
+        INSERT INTO leituras(
+        sensor_id,
+        temperatura, 
+        horario,
+        status,
+        prioridade)
+        VALUES (?, ?, ?, ?, ?)
+        """, (leitura["sensor_id"],
+        leitura["temperatura"],
+        leitura["horario"],
+        "pendente",
+        leitura["prioridade"]))
+
+        self.conexao.commit()
 
 
 class IotSensor:
