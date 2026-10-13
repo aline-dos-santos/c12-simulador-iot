@@ -11,6 +11,8 @@ from tkinter import ttk, messagebox
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
+from contextlib import closing
+
 import sqlite3
 
 SENTINELA = object()
@@ -24,78 +26,103 @@ class Configuracao:
     tempo_processamento: float
     num_servidores: int
     threads_por_servidor: int
-
-    #modo_sincronizador: str   # ARRUMAR AQ PRA INTERFACE PERMITIR ESCOLHER O MODO
+    modo_sincronizador: str = "mutex"
+    capacidade_semaforo: int = 1
 
 
 class Database:
-    def __init__(self):
-        conexao = sqlite3.connect("leituras_sensores.db")
+    def __init__(self, nome="leituras_sensores.db"):
+        self.nome = nome
+        with closing(self.conectar()) as conexao, conexao:
+            conexao.execute("""CREATE TABLE IF NOT EXISTS leituras (
+                leitura_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sensor_id INTEGER NOT NULL,
+                temperatura REAL NOT NULL,
+                horario REAL NOT NULL,
+                status TEXT NOT NULL,
+                prioridade INTEGER NOT NULL
+            )""")
 
-        conexao.execute("""
-        CREATE TABLE IF NOT EXISTS leituras (
-            leitura_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            sensor_id INTEGER NOT NULL,
-            temperatura REAL NOT NULL,
-            horario REAL NOT NULL,
-            status TEXT NOT NULL,
-            prioridade INTEGER NOT NULL
-        )
-        """)
+    def conectar(self):
+        return sqlite3.connect(self.nome, timeout=30)
 
-        conexao.commit()
-        conexao.close()
+    def reiniciar(self):
+        # Cada teste utiliza apenas suas próprias leituras.
+        with closing(self.conectar()) as conexao, conexao:
+            conexao.execute("DELETE FROM leituras")
 
     def gravacao(self, leitura):
+        with closing(self.conectar()) as conexao, conexao:
+            conexao.execute("""INSERT INTO leituras
+                (sensor_id, temperatura, horario, status, prioridade)
+                VALUES (?, ?, ?, 'pendente', ?)""",
+                (leitura["sensor_id"], leitura["temperatura"],
+                 leitura["horario"], leitura["prioridade"]))
 
-        conexao = sqlite3.connect("leituras_sensores.db")
+    def buscar_pendentes(self, limite=20):
+        with closing(self.conectar()) as conexao:
+            conexao.row_factory = sqlite3.Row
+            return [dict(linha) for linha in conexao.execute("""
+                SELECT * FROM leituras WHERE status = 'pendente'
+                ORDER BY leitura_id LIMIT ?""", (limite,))]
 
-        print(
-            f"[{threading.current_thread().name}] "
-            f"gravando leitura do sensor {leitura['sensor_id']}"
-        )
+    def reservar_leitura(self, leitura_id):
+        # O UPDATE condicional impede reserva duplicada (pendente -> na_fila).
+        with closing(self.conectar()) as conexao, conexao:
+            cursor = conexao.execute("""UPDATE leituras
+                SET status = 'na_fila'
+                WHERE leitura_id = ? AND status = 'pendente'""",
+                (leitura_id,))
+            return cursor.rowcount == 1
 
-        conexao.execute("""
-        INSERT INTO leituras (
-            sensor_id,
-            temperatura,
-            horario,
-            status,
-            prioridade
-        )
-        VALUES (?, ?, ?, ?, ?)
-        """, (
-            leitura["sensor_id"],
-            leitura["temperatura"],
-            leitura["horario"],
-            "pendente",
-            leitura["prioridade"]
-        ))
+    def iniciar_processamento(self, leitura_id):
+        # O servidor pegou da fila e começa a trabalhar (na_fila -> processando).
+        with closing(self.conectar()) as conexao, conexao:
+            cursor = conexao.execute("""UPDATE leituras
+                SET status = 'processando'
+                WHERE leitura_id = ? AND status = 'na_fila'""",
+                (leitura_id,))
+            return cursor.rowcount == 1
 
-        conexao.commit()
-        conexao.close()
+    def atualizar_status(self, leitura_id, novo_status):
+        if novo_status not in ("pendente", "na_fila", "processando", "concluido"):
+            raise ValueError("Status inválido")
+        with closing(self.conectar()) as conexao, conexao:
+            conexao.execute("UPDATE leituras SET status = ? WHERE leitura_id = ?",
+                            (novo_status, leitura_id))
 
+    def concluir_leitura(self, leitura_id):
+        with closing(self.conectar()) as conexao, conexao:
+            cursor = conexao.execute("""UPDATE leituras SET status = 'concluido'
+                WHERE leitura_id = ? AND status = 'processando'""",
+                (leitura_id,))
+            return cursor.rowcount == 1
+
+    def devolver_leitura(self, leitura_id):
+        with closing(self.conectar()) as conexao, conexao:
+            conexao.execute("""UPDATE leituras SET status = 'pendente'
+                WHERE leitura_id = ? AND status IN ('na_fila', 'processando')""",
+                (leitura_id,))
+
+    def contagem_status(self):
+        with closing(self.conectar()) as conexao:
+            return dict(conexao.execute(
+                "SELECT status, COUNT(*) FROM leituras GROUP BY status").fetchall())
 
 
 class Sincronizador:
     def __init__(self, modo="mutex", n_semaf=1):
         self.modo = modo
-
         if modo == "mutex":
             self.recurso = threading.Lock()
-
         elif modo == "semaforo":
             if n_semaf < 1:
-                raise ValueError("Semaforo deve ser >= 1")
+                raise ValueError("Semáforo deve ter capacidade >= 1")
             self.recurso = threading.Semaphore(n_semaf)
-
         elif modo == "nenhum":
             self.recurso = None
-
         else:
-            raise ValueError("Modo invalido")
-
-        # Protege apenas as metricas
+            raise ValueError("Modo de sincronização inválido")
         self.lock_metricas = threading.Lock()
         self.bloqueios = 0
         self.tempo_espera = 0.0
@@ -103,31 +130,13 @@ class Sincronizador:
     def adquirir(self):
         if self.recurso is None:
             return
-
         inicio = time.perf_counter()
-
-        # Tenta entrar sem bloquear
-        entrou = self.recurso.acquire(blocking=False)
-
-        if not entrou:
-            print(
-                f"[{threading.current_thread().name}] "
-                "BLOQUEADA: aguardando recurso"
-            )
-
-            # Agora espera ate conseguir entrar
+        if not self.recurso.acquire(blocking=False):
+            print(f"[{threading.current_thread().name}] BLOQUEADA")
             self.recurso.acquire()
-
-            espera = time.perf_counter() - inicio
-
             with self.lock_metricas:
                 self.bloqueios += 1
-                self.tempo_espera += espera
-
-        print(
-            f"[{threading.current_thread().name}] "
-            "entrou na secao critica"
-        )
+                self.tempo_espera += time.perf_counter() - inicio
 
     def liberar(self):
         if self.recurso is not None:
@@ -135,11 +144,8 @@ class Sincronizador:
 
     def obter_metricas(self):
         with self.lock_metricas:
-            return {
-                "bloqueios": self.bloqueios,
-                "tempo_espera": self.tempo_espera,
-            }
-
+            return {"bloqueios": self.bloqueios,
+                    "tempo_espera": self.tempo_espera}
 
 
 class ContadorCompartilhado:
@@ -147,39 +153,35 @@ class ContadorCompartilhado:
         self.valor = 0
 
     def incrementar(self):
-        valor_atual = self.valor
-
+        # Intencionalmente NÃO atômico para demonstrar lost update.
+        atual = self.valor
         time.sleep(0.0005)
-
-        self.valor = valor_atual + 1
+        self.valor = atual + 1
 
 
 class IotSensor:
-    def __init__(self, sensor_id,banco,sincronizador):
+    def __init__(self, sensor_id, banco, sincronizador, contador):
         self.sensor_id = sensor_id
         self.banco = banco
         self.sincronizador = sincronizador
+        self.contador = contador
 
     def gera_medida(self):
-        return {
-            "sensor_id": self.sensor_id,
-            "temperatura": random.uniform(15, 35),
-            "horario": time.time(),
-            "prioridade": random.randint(1,3)
-        }
+        return {"sensor_id": self.sensor_id,
+                "temperatura": random.uniform(15, 35),
+                "horario": time.time(), "prioridade": random.randint(1, 3)}
 
     def leitura(self, quantidade, intervalo, stop_event):
-        for indice in range(quantidade):
+        for _ in range(quantidade):
             if stop_event.is_set():
                 break
-
-            leitura = self.gera_medida()
+            medida = self.gera_medida()
             self.sincronizador.adquirir()
             try:
-                self.banco.gravacao(leitura)
+                self.banco.gravacao(medida)
+                self.contador.incrementar()
             finally:
                 self.sincronizador.liberar()
-
             if stop_event.wait(intervalo):
                 break
 
@@ -194,22 +196,16 @@ class ColetorResultados:
     def adicionar(self, leitura):
         with self.lock:
             self.total += 1
-
             if self.guardar_leituras:
                 self.resultados.append(leitura)
 
 
 class Servidor:
-    def __init__(
-        self,
-        servidor_id,
-        fila,
-        tempo_processamento,
-        coletor,
-        stop_event,
-    ):
+    def __init__(self, servidor_id, fila, banco, tempo_processamento,
+                 coletor, stop_event):
         self.servidor_id = servidor_id
         self.fila = fila
+        self.banco = banco
         self.tempo_processamento = tempo_processamento
         self.coletor = coletor
         self.stop_event = stop_event
@@ -217,140 +213,131 @@ class Servidor:
     def run(self):
         while True:
             leitura = self.fila.get()
-
             try:
                 if leitura is SENTINELA:
                     return
-
-                cancelado = self.stop_event.wait(self.tempo_processamento)
-
-                if cancelado:
+                leitura_id = leitura["leitura_id"]
+                # na_fila -> processando: só agora o servidor realmente trabalha.
+                if not self.banco.iniciar_processamento(leitura_id):
                     continue
-
-                leitura_processada = dict(leitura)
-                leitura_processada["servidor_id"] = self.servidor_id
-                leitura_processada["thread_servidor"] = threading.current_thread().name
-
-                self.coletor.adicionar(leitura_processada)
-
+                if self.stop_event.wait(self.tempo_processamento):
+                    self.banco.devolver_leitura(leitura_id)
+                    continue
+                if self.banco.concluir_leitura(leitura_id):
+                    resultado = dict(leitura)
+                    resultado["status"] = "concluido"
+                    resultado["servidor_id"] = self.servidor_id
+                    resultado["thread_servidor"] = threading.current_thread().name
+                    self.coletor.adicionar(resultado)
             finally:
                 self.fila.task_done()
 
 
+def despachar_pendentes(banco, fila, stop_event, fim_produtores):
+    # Ponte entre produtores e futuro scheduler; seleção FCFS provisória.
+    while not stop_event.is_set():
+        pendentes = banco.buscar_pendentes(limite=20)
+        for leitura in pendentes:
+            if stop_event.is_set():
+                break
+            if banco.reservar_leitura(leitura["leitura_id"]):
+                fila.put(leitura)
+        if fim_produtores.is_set() and not banco.buscar_pendentes(limite=1):
+            break
+        stop_event.wait(0.05)
+
+
 def dividir_trabalho(total, quantidade_threads):
-    base = total // quantidade_threads
-    resto = total % quantidade_threads
-
-    return [
-        base + (1 if indice < resto else 0)
-        for indice in range(quantidade_threads)
-    ]
+    base, resto = divmod(total, quantidade_threads)
+    return [base + (i < resto) for i in range(quantidade_threads)]
 
 
-def executar_simulacao(config, stop_event=None, guardar_leituras=True):
-    if stop_event is None:
-        stop_event = threading.Event()
-
-    fila = Queue()
+def executar_simulacao(config, stop_event=None, guardar_leituras=True,
+                       callback_estados=None):
+    stop_event = stop_event if stop_event is not None else threading.Event()
     banco = Database()
-    sincronizador = Sincronizador(modo="mutex")
-    
-    coletor = ColetorResultados(guardar_leituras=guardar_leituras)
-
+    banco.reiniciar()
+    fila = Queue()
+    fim_produtores = threading.Event()
+    sincronizador = Sincronizador(config.modo_sincronizador,
+                                  config.capacidade_semaforo)
+    contador = ContadorCompartilhado()
+    coletor = ColetorResultados(guardar_leituras)
     total_esperado = config.num_sensores * config.leituras_por_sensor
     total_threads_sensores = config.num_sensores * config.threads_por_sensor
     total_threads_servidor = config.num_servidores * config.threads_por_servidor
 
-    servidores = []
+    # Monitor opcional: publica a contagem de estados periodicamente.
+    parar_monitor = threading.Event()
+    monitor = None
+    if callback_estados is not None:
+        def monitorar():
+            while not parar_monitor.is_set():
+                callback_estados(banco.contagem_status())
+                parar_monitor.wait(0.1)
+        monitor = threading.Thread(target=monitorar, name="Monitor", daemon=True)
+
     threads_servidores = []
-
     for servidor_id in range(config.num_servidores):
-        servidor = Servidor(
-            servidor_id=servidor_id,
-            fila=fila,
-            tempo_processamento=config.tempo_processamento,
-            coletor=coletor,
-            stop_event=stop_event,
-        )
-        servidores.append(servidor)
+        servidor = Servidor(servidor_id, fila, banco, config.tempo_processamento,
+                            coletor, stop_event)
+        for i in range(config.threads_por_servidor):
+            threads_servidores.append(threading.Thread(
+                target=servidor.run, name=f"Servidor-{servidor_id}-Thread-{i}"))
 
-        for thread_id in range(config.threads_por_servidor):
-            thread = threading.Thread(
-                target=servidor.run,
-                name=f"Servidor-{servidor_id}-Thread-{thread_id}",
-                daemon=True,
-            )
-            threads_servidores.append(thread)
-
-    sensores = [IotSensor(i,banco,sincronizador)for i in range(config.num_sensores)]
     threads_sensores = []
-
-    for sensor in sensores:
-        distribuicao = dividir_trabalho(
-            config.leituras_por_sensor,
-            config.threads_por_sensor,
-        )
-
-        for thread_id, quantidade in enumerate(distribuicao):
-            thread = threading.Thread(
+    for sensor_id in range(config.num_sensores):
+        sensor = IotSensor(sensor_id, banco, sincronizador, contador)
+        for i, quantidade in enumerate(dividir_trabalho(
+                config.leituras_por_sensor, config.threads_por_sensor)):
+            threads_sensores.append(threading.Thread(
                 target=sensor.leitura,
-                args=(
-                    quantidade,
-                    config.intervalo_leituras,
-                    stop_event,
-                ),
-                name=f"Sensor-{sensor.sensor_id}-Thread-{thread_id}",
-                daemon=True,
-            )
-            threads_sensores.append(thread)
+                args=(quantidade, config.intervalo_leituras, stop_event),
+                name=f"Sensor-{sensor_id}-Thread-{i}"))
 
     inicio = time.perf_counter()
-
+    if monitor:
+        monitor.start()
     for thread in threads_servidores:
         thread.start()
-
+    despachante = threading.Thread(
+        target=despachar_pendentes,
+        args=(banco, fila, stop_event, fim_produtores), name="Despachante")
+    despachante.start()
     for thread in threads_sensores:
         thread.start()
-
     for thread in threads_sensores:
         thread.join()
-
-    fim_sensores = time.perf_counter()
-    tempo_geracao = fim_sensores - inicio
-
-    for _ in range(total_threads_servidor):
+    tempo_geracao = time.perf_counter() - inicio
+    fim_produtores.set()
+    despachante.join()
+    for _ in threads_servidores:
         fila.put(SENTINELA)
-
     for thread in threads_servidores:
         thread.join()
 
-    fim = time.perf_counter()
-    tempo_total = fim - inicio
-
-    leituras_processadas = coletor.total
-    throughput = (
-        leituras_processadas / tempo_total
-        if tempo_total > 0
-        else 0.0
-    )
-
-    taxa_geracao = (
-        total_esperado / tempo_geracao
-        if tempo_geracao > 0
-        else 0.0
-    )
-
+    tempo_total = time.perf_counter() - inicio
+    parar_monitor.set()
+    if monitor:
+        monitor.join()
+        callback_estados(banco.contagem_status())  # estado final na tela
+    estados = banco.contagem_status()
+    gravadas = sum(estados.values())
+    metricas = sincronizador.obter_metricas()
     return {
-        "config": config,
-        "total_esperado": total_esperado,
-        "leituras_processadas": leituras_processadas,
-        "tempo_geracao": tempo_geracao,
-        "tempo_total": tempo_total,
-        "throughput": throughput,
-        "taxa_geracao": taxa_geracao,
+        "config": config, "total_esperado": total_esperado,
+        "leituras_gravadas": gravadas,
+        "leituras_processadas": coletor.total,
+        "tempo_geracao": tempo_geracao, "tempo_total": tempo_total,
+        "taxa_geracao": gravadas / tempo_geracao if tempo_geracao else 0,
+        "throughput": coletor.total / tempo_total if tempo_total else 0,
         "total_threads_sensores": total_threads_sensores,
         "total_threads_servidor": total_threads_servidor,
-        "resultados": coletor.resultados,
+        "resultados": coletor.resultados, "estados": estados,
+        "contador": contador.valor,
+        "atualizacoes_perdidas": max(0, gravadas - contador.valor),
+        "bloqueios": metricas["bloqueios"],
+        "tempo_espera": metricas["tempo_espera"],
         "cancelado": stop_event.is_set(),
     }
 
@@ -358,764 +345,332 @@ def executar_simulacao(config, stop_event=None, guardar_leituras=True):
 class Aplicacao(tk.Tk):
     def __init__(self):
         super().__init__()
-
-        self.title("Simulador IoT - Sensores e Servidores Multithread")
-        self.geometry("1280x820")
-        self.minsize(1080, 700)
-
+        self.title("Simulador IoT — SQLite, Sincronização e Servidores")
+        self.geometry("1250x800")
+        self.minsize(1050, 680)
         self.stop_event = threading.Event()
         self.fila_ui = Queue()
         self.em_execucao = False
-
-        self._criar_variaveis()
+        self.variaveis = {}
         self._criar_interface()
-
         self.after(100, self._processar_fila_ui)
-
-    def _criar_variaveis(self):
-        self.var_num_sensores = tk.StringVar(value="5")
-        self.var_threads_sensor = tk.StringVar(value="1")
-        self.var_num_leituras = tk.StringVar(value="10")
-        self.var_intervalo = tk.StringVar(value="1.0")
-        self.var_tempo_processamento = tk.StringVar(value="0.5")
-        self.var_num_servidores = tk.StringVar(value="1")
-        self.var_threads_servidor = tk.StringVar(value="5")
-
-        self.var_grafico = tk.StringVar(value="Threads por servidor")
-        self.var_status = tk.StringVar(value="Pronto.")
 
     def _criar_interface(self):
         principal = ttk.Frame(self, padding=10)
         principal.pack(fill="both", expand=True)
-
-        principal.columnconfigure(0, weight=0)
         principal.columnconfigure(1, weight=1)
         principal.rowconfigure(0, weight=1)
-
-        painel = ttk.LabelFrame(
-            principal,
-            text="Parametros da simulacao",
-            padding=12,
-        )
+        painel = ttk.LabelFrame(principal, text="Parâmetros", padding=10)
         painel.grid(row=0, column=0, sticky="nsw", padx=(0, 10))
-
+        campos = [
+            ("num_sensores", "Número de sensores", "5"),
+            ("threads_por_sensor", "Threads por sensor", "2"),
+            ("leituras_por_sensor", "Leituras por sensor", "20"),
+            ("intervalo_leituras", "Intervalo de leitura (s)", "0"),
+            ("tempo_processamento", "Processamento (s)", "0.01"),
+            ("num_servidores", "Número de servidores", "1"),
+            ("threads_por_servidor", "Threads por servidor", "3"),
+        ]
         linha = 0
-
-        linha = self._campo(
-            painel,
-            linha,
-            "Numero de sensores",
-            self.var_num_sensores,
-        )
-
-        linha = self._campo(
-            painel,
-            linha,
-            "Threads por sensor",
-            self.var_threads_sensor,
-        )
-
-        linha = self._campo(
-            painel,
-            linha,
-            "Leituras por sensor",
-            self.var_num_leituras,
-        )
-
-        linha = self._campo(
-            painel,
-            linha,
-            "Intervalo entre leituras (s)",
-            self.var_intervalo,
-        )
-
-        linha = self._campo(
-            painel,
-            linha,
-            "Tempo processamento/leitura (s)",
-            self.var_tempo_processamento,
-        )
-
-        linha = self._campo(
-            painel,
-            linha,
-            "Numero de servidores",
-            self.var_num_servidores,
-        )
-
-        linha = self._campo(
-            painel,
-            linha,
-            "Threads por servidor",
-            self.var_threads_servidor,
-        )
-
-        ttk.Separator(painel).grid(
-            row=linha,
-            column=0,
-            columnspan=2,
-            sticky="ew",
-            pady=12,
-        )
+        for chave, rotulo, padrao in campos:
+            self.variaveis[chave] = tk.StringVar(value=padrao)
+            ttk.Label(painel, text=rotulo).grid(row=linha, column=0, sticky="w", pady=4)
+            ttk.Entry(painel, textvariable=self.variaveis[chave], width=14).grid(
+                row=linha, column=1, sticky="ew", pady=4)
+            linha += 1
+        self.var_sincronizacao = tk.StringVar(value="mutex")
+        ttk.Label(painel, text="Sincronização").grid(row=linha, column=0, sticky="w")
+        ttk.Combobox(painel, textvariable=self.var_sincronizacao,
+                     values=["nenhum", "mutex", "semaforo"],
+                     state="readonly", width=12).grid(row=linha, column=1, sticky="ew")
         linha += 1
-
-        ttk.Label(
-            painel,
-            text="Variavel do grafico",
-        ).grid(
-            row=linha,
-            column=0,
-            sticky="w",
-            pady=4,
-        )
-
-        combo = ttk.Combobox(
-            painel,
-            textvariable=self.var_grafico,
-            state="readonly",
-            width=22,
-            values=[
-                "Threads por servidor",
-                "Threads por sensor",
-            ],
-        )
-        combo.grid(
-            row=linha,
-            column=1,
-            sticky="ew",
-            pady=4,
-        )
+        self.var_capacidade = tk.StringVar(value="1")
+        ttk.Label(painel, text="Capacidade do semáforo").grid(row=linha, column=0, sticky="w")
+        ttk.Entry(painel, textvariable=self.var_capacidade, width=14).grid(
+            row=linha, column=1, sticky="ew")
         linha += 1
-
-        texto_ajuda = (
-            "No grafico, o valor informado no campo de threads\n"
-            "vira o MAXIMO da varredura.\n\n"
-            "Exemplo: Threads por servidor = 5\n"
-            "Executa: 1, 2, 3, 4 e 5 threads por servidor."
-        )
-
-        ttk.Label(
-            painel,
-            text=texto_ajuda,
-            justify="left",
-            foreground="#555555",
-        ).grid(
-            row=linha,
-            column=0,
-            columnspan=2,
-            sticky="w",
-            pady=(4, 12),
-        )
+        self.var_grafico = tk.StringVar(value="Threads por servidor")
+        ttk.Label(painel, text="Variável do gráfico").grid(row=linha, column=0, sticky="w", pady=8)
+        ttk.Combobox(painel, textvariable=self.var_grafico,
+                     values=["Threads por servidor", "Threads por sensor"],
+                     state="readonly", width=21).grid(row=linha, column=1, sticky="ew")
         linha += 1
-
-        self.botao_executar = ttk.Button(
-            painel,
-            text="Executar configuracao",
-            command=self._executar_configuracao,
-        )
-        self.botao_executar.grid(
-            row=linha,
-            column=0,
-            columnspan=2,
-            sticky="ew",
-            pady=4,
-        )
+        ttk.Label(painel, text="No gráfico, o número de threads\n"
+                              "é o máximo da varredura (1 até N).",
+                  justify="left").grid(row=linha, column=0, columnspan=2, pady=8)
         linha += 1
-
-        self.botao_grafico = ttk.Button(
-            painel,
-            text="Gerar grafico de linhas",
-            command=self._gerar_grafico,
-        )
-        self.botao_grafico.grid(
-            row=linha,
-            column=0,
-            columnspan=2,
-            sticky="ew",
-            pady=4,
-        )
+        self.botao_executar = ttk.Button(painel, text="Executar configuração",
+                                         command=self._executar_configuracao)
+        self.botao_executar.grid(row=linha, column=0, columnspan=2, sticky="ew", pady=4)
         linha += 1
-
-        self.botao_cancelar = ttk.Button(
-            painel,
-            text="Cancelar",
-            command=self._cancelar,
-            state="disabled",
-        )
-        self.botao_cancelar.grid(
-            row=linha,
-            column=0,
-            columnspan=2,
-            sticky="ew",
-            pady=4,
-        )
+        self.botao_grafico = ttk.Button(painel, text="Gerar gráfico de linhas",
+                                        command=self._gerar_grafico)
+        self.botao_grafico.grid(row=linha, column=0, columnspan=2, sticky="ew", pady=4)
         linha += 1
-
-        self.progresso = ttk.Progressbar(
-            painel,
-            mode="indeterminate",
-        )
-        self.progresso.grid(
-            row=linha,
-            column=0,
-            columnspan=2,
-            sticky="ew",
-            pady=(12, 4),
-        )
+        self.botao_cancelar = ttk.Button(painel, text="Cancelar", state="disabled",
+                                         command=self._cancelar)
+        self.botao_cancelar.grid(row=linha, column=0, columnspan=2, sticky="ew", pady=4)
         linha += 1
-
-        ttk.Label(
-            painel,
-            textvariable=self.var_status,
-            wraplength=300,
-        ).grid(
-            row=linha,
-            column=0,
-            columnspan=2,
-            sticky="w",
-            pady=4,
-        )
+        self.progresso = ttk.Progressbar(painel, mode="indeterminate")
+        self.progresso.grid(row=linha, column=0, columnspan=2, sticky="ew", pady=8)
+        linha += 1
+        self.var_status = tk.StringVar(value="Pronto.")
+        ttk.Label(painel, textvariable=self.var_status, wraplength=280).grid(
+            row=linha, column=0, columnspan=2, sticky="w")
 
         direita = ttk.Frame(principal)
         direita.grid(row=0, column=1, sticky="nsew")
-        direita.rowconfigure(1, weight=1)
         direita.columnconfigure(0, weight=1)
+        direita.rowconfigure(1, weight=1)
+        frame_resultado = ttk.LabelFrame(direita, text="Resultado", padding=6)
+        frame_resultado.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        self.tree_resultados = self._criar_tabela(
+            frame_resultado, [("metrica", "Métrica", 270), ("valor", "Valor", 170)],
+            altura=8)
+        abas = ttk.Notebook(direita)
+        abas.grid(row=1, column=0, sticky="nsew")
+        self.figuras = []
+        for nome, titulo, ylabel in [
+            ("tempo", "Tempo total × número de threads", "Tempo total (s)"),
+            ("throughput", "Throughput × número de threads", "Leituras/s"),
+        ]:
+            aba = ttk.Frame(abas)
+            abas.add(aba, text="Gráfico" if nome == "tempo" else "Throughput")
+            figura = Figure(figsize=(7, 4), dpi=100)
+            eixo = figura.add_subplot(111)
+            eixo.set_title(titulo)
+            eixo.set_ylabel(ylabel)
+            eixo.grid(True, alpha=0.3)
+            canvas = FigureCanvasTkAgg(figura, master=aba)
+            canvas.draw()
+            canvas.get_tk_widget().pack(fill="both", expand=True)
+            self.figuras.append((eixo, figura, canvas))
+        aba_curva = ttk.Frame(abas)
+        abas.add(aba_curva, text="Tabela da curva")
+        self.tree_curva = self._criar_tabela(aba_curva, [
+            ("valor", "Threads", 80), ("workers", "Workers servidor", 120),
+            ("tempo", "Tempo (s)", 110), ("throughput", "Leituras/s", 110),
+            ("processadas", "Concluídas", 110)])
+        aba_leituras = ttk.Frame(abas)
+        abas.add(aba_leituras, text="Últimas leituras")
+        self.tree_leituras = self._criar_tabela(aba_leituras, [
+            ("sensor", "Sensor", 65), ("temperatura", "Temperatura", 100),
+            ("horario", "Horário", 135), ("prioridade", "Prioridade", 80),
+            ("servidor", "Servidor", 75), ("thread", "Thread", 190),
+            ("status", "Status", 100)])
 
-        resultados_frame = ttk.LabelFrame(
-            direita,
-            text="Resultado da configuracao",
-            padding=8,
-        )
-        resultados_frame.grid(
-            row=0,
-            column=0,
-            sticky="ew",
-            pady=(0, 10),
-        )
+        # Painel de estados ao vivo (atualizado pelo monitor durante a execução).
+        frame_estados = ttk.LabelFrame(direita, text="Estados ao vivo", padding=6)
+        frame_estados.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+        self.var_estados = {}
+        for coluna, (chave, rotulo) in enumerate([
+                ("pendente", "Pendentes"), ("na_fila", "Na fila"),
+                ("processando", "Processando"), ("concluido", "Concluídas")]):
+            self.var_estados[chave] = tk.StringVar(value="0")
+            ttk.Label(frame_estados, text=f"{rotulo}:").grid(
+                row=0, column=coluna * 2, padx=(8, 2))
+            ttk.Label(frame_estados, textvariable=self.var_estados[chave],
+                      font=("TkDefaultFont", 11, "bold")).grid(
+                row=0, column=coluna * 2 + 1, padx=(0, 12))
 
-        self.tree_resultados = ttk.Treeview(
-            resultados_frame,
-            columns=("metrica", "valor"),
-            show="headings",
-            height=7,
-        )
-        self.tree_resultados.heading("metrica", text="Metrica")
-        self.tree_resultados.heading("valor", text="Valor")
-        self.tree_resultados.column("metrica", width=300)
-        self.tree_resultados.column("valor", width=220)
-        self.tree_resultados.pack(fill="x", expand=True)
-
-        notebook = ttk.Notebook(direita)
-        notebook.grid(row=1, column=0, sticky="nsew")
-
-        aba_grafico = ttk.Frame(notebook)
-        notebook.add(aba_grafico, text="Grafico")
-
-        self.figura = Figure(figsize=(8, 5), dpi=100)
-        self.eixo = self.figura.add_subplot(111)
-
-        self.eixo.set_title("Tempo total x numero de threads")
-        self.eixo.set_xlabel("Threads")
-        self.eixo.set_ylabel("Tempo total (s)")
-        self.eixo.grid(True, alpha=0.3)
-
-        self.canvas = FigureCanvasTkAgg(
-            self.figura,
-            master=aba_grafico,
-        )
-        self.canvas.draw()
-        self.canvas.get_tk_widget().pack(
-            fill="both",
-            expand=True,
-        )
-
-        aba_throughput = ttk.Frame(notebook)
-        notebook.add(aba_throughput, text="Throughput")
-
-        self.figura_throughput = Figure(figsize=(8, 5), dpi=100)
-        self.eixo_throughput = self.figura_throughput.add_subplot(111)
-
-        self.eixo_throughput.set_title("Throughput x numero de threads")
-        self.eixo_throughput.set_xlabel("Threads")
-        self.eixo_throughput.set_ylabel("Throughput (leituras/s)")
-        self.eixo_throughput.grid(True, alpha=0.3)
-
-        self.canvas_throughput = FigureCanvasTkAgg(
-            self.figura_throughput,
-            master=aba_throughput,
-        )
-        self.canvas_throughput.draw()
-        self.canvas_throughput.get_tk_widget().pack(
-            fill="both",
-            expand=True,
-        )
-
-        aba_curva = ttk.Frame(notebook)
-        notebook.add(aba_curva, text="Tabela da curva")
-
-        colunas_curva = (
-            "valor",
-            "workers",
-            "tempo",
-            "throughput",
-            "processadas",
-        )
-
-        self.tree_curva = ttk.Treeview(
-            aba_curva,
-            columns=colunas_curva,
-            show="headings",
-        )
-
-        self.tree_curva.heading("valor", text="Valor variado")
-        self.tree_curva.heading("workers", text="Threads servidor totais")
-        self.tree_curva.heading("tempo", text="Tempo total (s)")
-        self.tree_curva.heading("throughput", text="Throughput (leituras/s)")
-        self.tree_curva.heading("processadas", text="Leituras processadas")
-
-        self.tree_curva.column("valor", width=110, anchor="center")
-        self.tree_curva.column("workers", width=160, anchor="center")
-        self.tree_curva.column("tempo", width=130, anchor="center")
-        self.tree_curva.column("throughput", width=170, anchor="center")
-        self.tree_curva.column("processadas", width=160, anchor="center")
-
-        self.tree_curva.pack(fill="both", expand=True)
-
-        aba_leituras = ttk.Frame(notebook)
-        notebook.add(aba_leituras, text="Ultimas leituras")
-
-        colunas_leituras = (
-            "sensor",
-            "temperatura",
-            "horario",
-            "servidor",
-            "thread",
-        )
-
-        self.tree_leituras = ttk.Treeview(
-            aba_leituras,
-            columns=colunas_leituras,
-            show="headings",
-        )
-
-        self.tree_leituras.heading("sensor", text="Sensor")
-        self.tree_leituras.heading("temperatura", text="Temperatura")
-        self.tree_leituras.heading("horario", text="Horario")
-        self.tree_leituras.heading("servidor", text="Servidor")
-        self.tree_leituras.heading("thread", text="Thread servidor")
-
-        self.tree_leituras.column("sensor", width=80, anchor="center")
-        self.tree_leituras.column("temperatura", width=120, anchor="center")
-        self.tree_leituras.column("horario", width=170, anchor="center")
-        self.tree_leituras.column("servidor", width=90, anchor="center")
-        self.tree_leituras.column("thread", width=220)
-
-        self.tree_leituras.pack(fill="both", expand=True)
-
-    def _campo(self, parent, linha, texto, variavel):
-        ttk.Label(
-            parent,
-            text=texto,
-        ).grid(
-            row=linha,
-            column=0,
-            sticky="w",
-            pady=4,
-            padx=(0, 8),
-        )
-
-        entrada = ttk.Entry(
-            parent,
-            textvariable=variavel,
-            width=12,
-        )
-        entrada.grid(
-            row=linha,
-            column=1,
-            sticky="ew",
-            pady=4,
-        )
-
-        return linha + 1
+    @staticmethod
+    def _criar_tabela(parent, colunas, altura=14):
+        tree = ttk.Treeview(parent, columns=[c[0] for c in colunas],
+                            show="headings", height=altura)
+        for chave, titulo, largura in colunas:
+            tree.heading(chave, text=titulo)
+            tree.column(chave, width=largura, anchor="center")
+        tree.pack(fill="both", expand=True)
+        return tree
 
     def _ler_configuracao(self):
         try:
+            v = self.variaveis
             config = Configuracao(
-                num_sensores=int(self.var_num_sensores.get()),
-                threads_por_sensor=int(self.var_threads_sensor.get()),
-                leituras_por_sensor=int(self.var_num_leituras.get()),
-                intervalo_leituras=float(self.var_intervalo.get()),
-                tempo_processamento=float(
-                    self.var_tempo_processamento.get()
-                ),
-                num_servidores=int(self.var_num_servidores.get()),
-                threads_por_servidor=int(
-                    self.var_threads_servidor.get()
-                ),
-            )
-        except ValueError:
-            raise ValueError(
-                "Preencha os campos numericos com valores validos."
-            )
-
-        inteiros_positivos = {
-            "Numero de sensores": config.num_sensores,
-            "Threads por sensor": config.threads_por_sensor,
-            "Leituras por sensor": config.leituras_por_sensor,
-            "Numero de servidores": config.num_servidores,
-            "Threads por servidor": config.threads_por_servidor,
-        }
-
-        for nome, valor in inteiros_positivos.items():
-            if valor < 1:
-                raise ValueError(f"{nome} deve ser maior ou igual a 1.")
-
-        if config.intervalo_leituras < 0:
-            raise ValueError(
-                "Intervalo entre leituras nao pode ser negativo."
-            )
-
-        if config.tempo_processamento < 0:
-            raise ValueError(
-                "Tempo de processamento nao pode ser negativo."
-            )
-
+                num_sensores=int(v["num_sensores"].get()),
+                threads_por_sensor=int(v["threads_por_sensor"].get()),
+                leituras_por_sensor=int(v["leituras_por_sensor"].get()),
+                intervalo_leituras=float(v["intervalo_leituras"].get()),
+                tempo_processamento=float(v["tempo_processamento"].get()),
+                num_servidores=int(v["num_servidores"].get()),
+                threads_por_servidor=int(v["threads_por_servidor"].get()),
+                modo_sincronizador=self.var_sincronizacao.get(),
+                capacidade_semaforo=int(self.var_capacidade.get()))
+        except ValueError as erro:
+            raise ValueError("Preencha os campos com números válidos.") from erro
+        for campo in ("num_sensores", "threads_por_sensor", "leituras_por_sensor",
+                      "num_servidores", "threads_por_servidor", "capacidade_semaforo"):
+            if getattr(config, campo) < 1:
+                raise ValueError(f"{campo} deve ser >= 1")
+        if config.intervalo_leituras < 0 or config.tempo_processamento < 0:
+            raise ValueError("Tempos não podem ser negativos")
         return config
 
     def _set_em_execucao(self, ativo):
         self.em_execucao = ativo
-
+        self.botao_executar.configure(state="disabled" if ativo else "normal")
+        self.botao_grafico.configure(state="disabled" if ativo else "normal")
+        self.botao_cancelar.configure(state="normal" if ativo else "disabled")
         if ativo:
-            self.botao_executar.configure(state="disabled")
-            self.botao_grafico.configure(state="disabled")
-            self.botao_cancelar.configure(state="normal")
             self.progresso.start(10)
         else:
-            self.botao_executar.configure(state="normal")
-            self.botao_grafico.configure(state="normal")
-            self.botao_cancelar.configure(state="disabled")
             self.progresso.stop()
 
-    def _executar_configuracao(self):
+    def _iniciar(self, alvo, args):
         if self.em_execucao:
             return
+        self.stop_event = threading.Event()
+        self._set_em_execucao(True)
+        threading.Thread(target=alvo, args=args, daemon=True).start()
 
+    def _executar_configuracao(self):
         try:
             config = self._ler_configuracao()
         except ValueError as erro:
-            messagebox.showerror("Configuracao invalida", str(erro))
+            messagebox.showerror("Configuração inválida", str(erro))
             return
-
-        self.stop_event = threading.Event()
-        self._set_em_execucao(True)
-        self.var_status.set("Executando configuracao...")
-
-        thread = threading.Thread(
-            target=self._worker_configuracao,
-            args=(config,),
-            daemon=True,
-        )
-        thread.start()
+        self.var_status.set("Executando configuração...")
+        self._iniciar(self._worker_configuracao, (config,))
 
     def _worker_configuracao(self, config):
         try:
             resultado = executar_simulacao(
-                config,
-                stop_event=self.stop_event,
-                guardar_leituras=True,
-            )
-
+                config, self.stop_event, True,
+                callback_estados=lambda e: self.fila_ui.put(("estados", e)))
             self.fila_ui.put(("resultado", resultado))
-
         except Exception as erro:
             self.fila_ui.put(("erro", str(erro)))
 
     def _gerar_grafico(self):
-        if self.em_execucao:
-            return
-
         try:
             config = self._ler_configuracao()
         except ValueError as erro:
-            messagebox.showerror("Configuracao invalida", str(erro))
+            messagebox.showerror("Configuração inválida", str(erro))
             return
-
         variavel = self.var_grafico.get()
-
-        if variavel == "Threads por servidor":
-            maximo = config.threads_por_servidor
-        else:
-            maximo = config.threads_por_sensor
-
-        self.stop_event = threading.Event()
-        self._set_em_execucao(True)
-
-        self.var_status.set(
-            f"Gerando curva: {variavel}, de 1 ate {maximo}..."
-        )
-
-        self._limpar_tree(self.tree_curva)
-
-        thread = threading.Thread(
-            target=self._worker_grafico,
-            args=(config, variavel, maximo),
-            daemon=True,
-        )
-        thread.start()
+        maximo = (config.threads_por_servidor if variavel == "Threads por servidor"
+                  else config.threads_por_sensor)
+        self._limpar_tabela(self.tree_curva)
+        self.var_status.set(f"Gerando curva: {variavel}, de 1 até {maximo}...")
+        self._iniciar(self._worker_grafico, (config, variavel, maximo))
 
     def _worker_grafico(self, config, variavel, maximo):
         pontos = []
-
         try:
             for valor in range(1, maximo + 1):
                 if self.stop_event.is_set():
                     break
-
-                if variavel == "Threads por servidor":
-                    config_teste = replace(
-                        config,
-                        threads_por_servidor=valor,
-                    )
-                else:
-                    config_teste = replace(
-                        config,
-                        threads_por_sensor=valor,
-                    )
-
-                self.fila_ui.put(
-                    (
-                        "status",
-                        f"Teste {valor}/{maximo}: {variavel} = {valor}",
-                    )
-                )
-
-                resultado = executar_simulacao(
-                    config_teste,
-                    stop_event=self.stop_event,
-                    guardar_leituras=False,
-                )
-
-                pontos.append(
-                    {
-                        "valor": valor,
-                        "tempo_total": resultado["tempo_total"],
-                        "throughput": resultado["throughput"],
-                        "leituras_processadas": resultado[
-                            "leituras_processadas"
-                        ],
-                        "threads_servidor_totais": resultado[
-                            "total_threads_servidor"
-                        ],
-                    }
-                )
-
-                self.fila_ui.put(("ponto_curva", pontos[-1]))
-
-            self.fila_ui.put(
-                (
-                    "grafico_pronto",
-                    {
-                        "variavel": variavel,
-                        "pontos": pontos,
-                        "cancelado": self.stop_event.is_set(),
-                    },
-                )
-            )
-
+                config_teste = replace(config, **{
+                    "threads_por_servidor" if variavel == "Threads por servidor"
+                    else "threads_por_sensor": valor})
+                self.fila_ui.put(("status", f"Teste {valor}/{maximo}"))
+                r = executar_simulacao(config_teste, self.stop_event, False)
+                ponto = {"valor": valor, "tempo_total": r["tempo_total"],
+                         "throughput": r["throughput"],
+                         "leituras_processadas": r["leituras_processadas"],
+                         "threads_servidor_totais": r["total_threads_servidor"]}
+                pontos.append(ponto)
+                self.fila_ui.put(("ponto", ponto))
+            self.fila_ui.put(("grafico", (variavel, pontos, self.stop_event.is_set())))
         except Exception as erro:
             self.fila_ui.put(("erro", str(erro)))
 
     def _cancelar(self):
-        if self.em_execucao:
-            self.stop_event.set()
-            self.var_status.set("Cancelamento solicitado...")
+        self.stop_event.set()
+        self.var_status.set("Cancelamento solicitado...")
 
     def _processar_fila_ui(self):
         try:
             while True:
                 tipo, payload = self.fila_ui.get_nowait()
-
                 if tipo == "resultado":
                     self._mostrar_resultado(payload)
                     self._set_em_execucao(False)
-
-                    if payload["cancelado"]:
-                        self.var_status.set("Execucao cancelada.")
-                    else:
-                        self.var_status.set("Configuracao concluida.")
-
+                    self.var_status.set("Cancelada." if payload["cancelado"]
+                                        else "Configuração concluída.")
+                elif tipo == "ponto":
+                    self.tree_curva.insert("", "end", values=(
+                        payload["valor"], payload["threads_servidor_totais"],
+                        f'{payload["tempo_total"]:.4f}',
+                        f'{payload["throughput"]:.2f}',
+                        payload["leituras_processadas"]))
+                elif tipo == "grafico":
+                    variavel, pontos, cancelado = payload
+                    self._mostrar_grafico(variavel, pontos)
+                    self._set_em_execucao(False)
+                    self.var_status.set("Curva interrompida." if cancelado
+                                        else "Gráfico concluído.")
+                elif tipo == "estados":
+                    self._atualizar_estados(payload)
                 elif tipo == "status":
                     self.var_status.set(payload)
-
-                elif tipo == "ponto_curva":
-                    self._adicionar_ponto_tabela(payload)
-
-                elif tipo == "grafico_pronto":
-                    self._mostrar_grafico(
-                        payload["variavel"],
-                        payload["pontos"],
-                    )
-                    self._set_em_execucao(False)
-
-                    if payload["cancelado"]:
-                        self.var_status.set(
-                            "Curva interrompida pelo usuario."
-                        )
-                    else:
-                        self.var_status.set(
-                            "Grafico de linhas concluido."
-                        )
-
                 elif tipo == "erro":
                     self._set_em_execucao(False)
-                    self.var_status.set("Erro.")
+                    self.var_status.set("Erro na execução.")
                     messagebox.showerror("Erro", payload)
-
                 self.fila_ui.task_done()
-
         except Empty:
             pass
-
         self.after(100, self._processar_fila_ui)
 
-    def _mostrar_resultado(self, resultado):
-        self._limpar_tree(self.tree_resultados)
+    def _atualizar_estados(self, estados):
+        for chave, var in self.var_estados.items():
+            var.set(str(estados.get(chave, 0)))
 
-        config = resultado["config"]
-
-        metricas = [
-            ("Sensores", config.num_sensores),
-            (
-                "Threads de sensores totais",
-                resultado["total_threads_sensores"],
-            ),
-            (
-                "Threads de servidor totais",
-                resultado["total_threads_servidor"],
-            ),
-            ("Leituras esperadas", resultado["total_esperado"]),
-            (
-                "Leituras processadas",
-                resultado["leituras_processadas"],
-            ),
-            (
-                "Tempo de geracao dos sensores",
-                f'{resultado["tempo_geracao"]:.4f} s',
-            ),
-            (
-                "Tempo total do sistema",
-                f'{resultado["tempo_total"]:.4f} s',
-            ),
-            (
-                "Taxa de geracao",
-                f'{resultado["taxa_geracao"]:.4f} leituras/s',
-            ),
-            (
-                "Throughput",
-                f'{resultado["throughput"]:.4f} leituras/s',
-            ),
+    def _mostrar_resultado(self, r):
+        self._limpar_tabela(self.tree_resultados)
+        itens = [
+            ("Sensores", r["config"].num_sensores),
+            ("Modo de sincronização", r["config"].modo_sincronizador),
+            ("Threads de sensores", r["total_threads_sensores"]),
+            ("Threads de servidores", r["total_threads_servidor"]),
+            ("Leituras esperadas", r["total_esperado"]),
+            ("Leituras gravadas", r["leituras_gravadas"]),
+            ("Pendentes", r["estados"].get("pendente", 0)),
+            ("Na fila", r["estados"].get("na_fila", 0)),
+            ("Processando", r["estados"].get("processando", 0)),
+            ("Concluídas", r["estados"].get("concluido", 0)),
+            ("Contador demonstrativo", r["contador"]),
+            ("Atualizações perdidas", r["atualizacoes_perdidas"]),
+            ("Bloqueios", r["bloqueios"]),
+            ("Tempo total de espera", f'{r["tempo_espera"]:.4f} s'),
+            ("Tempo de geração", f'{r["tempo_geracao"]:.4f} s'),
+            ("Tempo total", f'{r["tempo_total"]:.4f} s'),
+            ("Taxa de geração", f'{r["taxa_geracao"]:.2f} leituras/s'),
+            ("Throughput", f'{r["throughput"]:.2f} leituras/s'),
         ]
-
-        for metrica, valor in metricas:
-            self.tree_resultados.insert(
-                "",
-                "end",
-                values=(metrica, valor),
-            )
-
-        self._limpar_tree(self.tree_leituras)
-
-        ultimas = resultado["resultados"][-100:]
-
-        for leitura in ultimas:
-            horario = datetime.fromtimestamp(
-                leitura["horario"]
-            ).strftime("%H:%M:%S.%f")[:-3]
-
-            self.tree_leituras.insert(
-                "",
-                "end",
-                values=(
-                    leitura["sensor_id"],
-                    f'{leitura["temperatura"]:.2f} C',
-                    horario,
-                    leitura.get("servidor_id", "-"),
-                    leitura.get("thread_servidor", "-"),
-                ),
-            )
-
-    def _adicionar_ponto_tabela(self, ponto):
-        self.tree_curva.insert(
-            "",
-            "end",
-            values=(
-                ponto["valor"],
-                ponto["threads_servidor_totais"],
-                f'{ponto["tempo_total"]:.4f}',
-                f'{ponto["throughput"]:.4f}',
-                ponto["leituras_processadas"],
-            ),
-        )
+        for item in itens:
+            self.tree_resultados.insert("", "end", values=item)
+        self._limpar_tabela(self.tree_leituras)
+        for leitura in r["resultados"][-100:]:
+            horario = datetime.fromtimestamp(leitura["horario"]).strftime(
+                "%H:%M:%S.%f")[:-3]
+            self.tree_leituras.insert("", "end", values=(
+                leitura["sensor_id"], f'{leitura["temperatura"]:.2f} °C',
+                horario, leitura["prioridade"], leitura["servidor_id"],
+                leitura["thread_servidor"], leitura["status"]))
 
     def _mostrar_grafico(self, variavel, pontos):
-        self.eixo.clear()
-
-        if not pontos:
-            self.eixo.set_title("Nenhum ponto gerado")
-            self.canvas.draw()
-
-            self.eixo_throughput.clear()
-            self.eixo_throughput.set_title("Nenhum ponto gerado")
-            self.canvas_throughput.draw()
-            return
-
-        x = [p["valor"] for p in pontos]
-        y = [p["tempo_total"] for p in pontos]
-
-        self.eixo.plot(
-            x,
-            y,
-            marker="o",
-            linewidth=2,
-        )
-
-        self.eixo.set_title(
-            f"Tempo total x {variavel}"
-        )
-        self.eixo.set_xlabel(variavel)
-        self.eixo.set_ylabel("Tempo total do sistema (s)")
-        self.eixo.set_xticks(x)
-        self.eixo.grid(True, alpha=0.3)
-
-        self.figura.tight_layout()
-        self.canvas.draw()
-
-        throughput = [p["throughput"] for p in pontos]
-
-        self.eixo_throughput.clear()
-        self.eixo_throughput.plot(
-            x,
-            throughput,
-            marker="o",
-            linewidth=2,
-        )
-        self.eixo_throughput.set_title(
-            f"Throughput x {variavel}"
-        )
-        self.eixo_throughput.set_xlabel(variavel)
-        self.eixo_throughput.set_ylabel("Throughput (leituras/s)")
-        self.eixo_throughput.set_xticks(x)
-        self.eixo_throughput.grid(True, alpha=0.3)
-
-        self.figura_throughput.tight_layout()
-        self.canvas_throughput.draw()
+        for indice, chave in enumerate(("tempo_total", "throughput")):
+            eixo, figura, canvas = self.figuras[indice]
+            eixo.clear()
+            if pontos:
+                x = [p["valor"] for p in pontos]
+                eixo.plot(x, [p[chave] for p in pontos], marker="o", linewidth=2)
+                eixo.set_xticks(x)
+            eixo.set_title(("Tempo total" if indice == 0 else "Throughput")
+                           + " × " + variavel)
+            eixo.set_xlabel(variavel)
+            eixo.set_ylabel("Segundos" if indice == 0 else "Leituras/s")
+            eixo.grid(True, alpha=0.3)
+            figura.tight_layout()
+            canvas.draw()
 
     @staticmethod
-    def _limpar_tree(tree):
+    def _limpar_tabela(tree):
         for item in tree.get_children():
             tree.delete(item)
 
 
 if __name__ == "__main__":
-    app = Aplicacao()
-    app.mainloop()
+    Aplicacao().mainloop()
