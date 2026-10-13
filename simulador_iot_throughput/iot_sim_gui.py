@@ -76,37 +76,70 @@ class Database:
         conexao.close()
 
 
+
 class Sincronizador:
-    def __init__(self, modo="mutex", n_semaf = 1):
+    def __init__(self, modo="mutex", n_semaf=1):
         self.modo = modo
 
         if modo == "mutex":
             self.recurso = threading.Lock()
 
         elif modo == "semaforo":
+            if n_semaf < 1:
+                raise ValueError("Semaforo deve ser >= 1")
             self.recurso = threading.Semaphore(n_semaf)
 
         elif modo == "nenhum":
             self.recurso = None
 
         else:
-            raise ValueError("Modo de sincronização inválido.")
+            raise ValueError("Modo invalido")
+
+        # Protege apenas as metricas
+        self.lock_metricas = threading.Lock()
+        self.bloqueios = 0
+        self.tempo_espera = 0.0
 
     def adquirir(self):
-        if self.recurso is not None:
+        if self.recurso is None:
+            return
+
+        inicio = time.perf_counter()
+
+        # Tenta entrar sem bloquear
+        entrou = self.recurso.acquire(blocking=False)
+
+        if not entrou:
             print(
-            f"[{threading.current_thread().name}] "
-            f"tentando acessar o banco"
+                f"[{threading.current_thread().name}] "
+                "BLOQUEADA: aguardando recurso"
             )
+
+            # Agora espera ate conseguir entrar
             self.recurso.acquire()
-            print(
+
+            espera = time.perf_counter() - inicio
+
+            with self.lock_metricas:
+                self.bloqueios += 1
+                self.tempo_espera += espera
+
+        print(
             f"[{threading.current_thread().name}] "
-            f"entrou na seção crítica"
-            )
+            "entrou na secao critica"
+        )
 
     def liberar(self):
         if self.recurso is not None:
             self.recurso.release()
+
+    def obter_metricas(self):
+        with self.lock_metricas:
+            return {
+                "bloqueios": self.bloqueios,
+                "tempo_espera": self.tempo_espera,
+            }
+
 
 
 class ContadorCompartilhado:
