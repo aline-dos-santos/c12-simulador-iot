@@ -109,6 +109,18 @@ class Sincronizador:
             self.recurso.release()
 
 
+class ContadorCompartilhado:
+    def __init__(self):
+        self.valor = 0
+
+    def incrementar(self):
+        valor_atual = self.valor
+
+        time.sleep(0.0005)
+
+        self.valor = valor_atual + 1
+
+
 class IotSensor:
     def __init__(self, sensor_id,banco,sincronizador):
         self.sensor_id = sensor_id
