@@ -622,6 +622,14 @@ class Aplicacao(tk.Tk):
         self.canvas_gantt.get_tk_widget().pack(fill="both", expand=True)
         self._desenhar_gantt()
 
+        aba_sync = ttk.Frame(abas, padding=4)
+        abas.add(aba_sync, text="Comparação de sincronização")
+        self.figura_sync = Figure(figsize=(7, 4), dpi=100)
+        self.eixos_sync = self.figura_sync.subplots(2, 2)
+        self.canvas_sync = FigureCanvasTkAgg(self.figura_sync, master=aba_sync)
+        self.canvas_sync.get_tk_widget().pack(fill="both", expand=True)
+        self._mostrar_comparacao_sync([])
+
         # Painel de estados ao vivo (atualizado pelo monitor durante a execução).
         frame_estados = ttk.LabelFrame(direita, text="Estados ao vivo", padding=6)
         frame_estados.grid(row=2, column=0, sticky="ew", pady=(8, 0))
@@ -700,16 +708,37 @@ class Aplicacao(tk.Tk):
     def _worker_configuracao(self, config):
         try:
             resultado = executar_simulacao(
-                config, self.stop_event, True,
+                config,
+                self.stop_event,
+                True,
                 callback_estados=lambda e: self.fila_ui.put(("estados", e)),
-                callback_eventos=self.fila_ui.put)
+                callback_eventos=self.fila_ui.put
+            )
+
             self.fila_ui.put(("resultado", resultado))
+
             if self.stop_event.is_set():
                 self.fila_ui.put(("comparacao", []))
+                self.fila_ui.put(("comparacao_sync", []))
+                return
+
+            # Primeiro compara FCFS e Prioridade.
+            config_alg = replace(
+                config,
+                num_servidores=1,
+                threads_por_servidor=1
+            )
+
+            ok = self._worker_comparacao(config_alg)
+
+            if not ok:
+                return
+
+            if self.stop_event.is_set():
+                self.fila_ui.put(("comparacao_sync", []))
             else:
-                # A comparação clássica usa um único worker nos dois algoritmos.
-                self._worker_comparacao(replace(
-                    config, num_servidores=1, threads_por_servidor=1))
+                # Depois compara os modos de sincronização.
+                self._worker_sincronizacao(config)
         except Exception as erro:
             self.fila_ui.put(("erro", str(erro)))
 
@@ -779,6 +808,46 @@ class Aplicacao(tk.Tk):
                                               callback_eventos=evento_comparacao)
                 resultados.append(resultado)
             self.fila_ui.put(("comparacao", resultados))
+            return True
+        except Exception as erro:
+            self.fila_ui.put(("erro", str(erro)))
+            return False
+
+    def _worker_sincronizacao(self, config):
+        try:
+            # Mesmas temperaturas e prioridades em todos os modos.
+            carga = {}
+            for sensor_id in range(config.num_sensores):
+                sensor = IotSensor(sensor_id, None, None, None)
+                carga[sensor_id] = [sensor.gera_medida()
+                                    for _ in range(config.leituras_por_sensor)]
+
+            modos = [("nenhum", 1), ("mutex", 1), ("semaforo", 1)]
+            if config.capacidade_semaforo > 1:
+                modos.append(("semaforo", config.capacidade_semaforo))
+
+            resultados = []
+            for modo, capacidade in modos:
+                if self.stop_event.is_set():
+                    break
+                nome = (f"{modo}({capacidade})" if modo == "semaforo"
+                        else modo)
+                self.fila_ui.put((
+                    "status", f"Testando sincronização: {nome}..."))
+                teste = replace(
+                    config,
+                    modo_sincronizador=modo,
+                    capacidade_semaforo=capacidade
+                )
+                resultado = executar_simulacao(
+                    teste,
+                    self.stop_event,
+                    guardar_leituras=False,
+                    carga=carga
+                )
+                resultados.append(resultado)
+
+            self.fila_ui.put(("comparacao_sync", resultados))
         except Exception as erro:
             self.fila_ui.put(("erro", str(erro)))
 
@@ -812,9 +881,17 @@ class Aplicacao(tk.Tk):
                         self.var_gantt.set("Comparação FCFS × Prioridade")
                         self._desenhar_gantt()
                         self._gantt_sujo = False
+                    self.var_status.set(
+                        "Algoritmos comparados; comparando sincronização..."
+                        if len(payload) == 2 and not self.stop_event.is_set()
+                        else "Cancelamento em andamento...")
+                elif tipo == "comparacao_sync":
+                    self._mostrar_comparacao_sync(payload)
                     self._set_em_execucao(False)
-                    self.var_status.set("Comparação concluída." if len(payload) == 2
-                                        and not self.stop_event.is_set() else "Interrompida.")
+                    self.var_status.set(
+                        "Comparações concluídas."
+                        if payload and not self.stop_event.is_set()
+                        else "Interrompida.")
                 elif tipo == "estados":
                     self._atualizar_estados(payload)
                 elif tipo == "log":
@@ -868,6 +945,7 @@ class Aplicacao(tk.Tk):
         self.gantt_comparacao = {"FCFS": [], "Prioridade": []}
         self.var_gantt.set("Execução individual")
         self._desenhar_gantt()
+        self._mostrar_comparacao_sync([])
         self._atualizar_estados({})
 
     def _adicionar_log(self, texto):
@@ -954,6 +1032,55 @@ class Aplicacao(tk.Tk):
         self.figura_gantt.tight_layout()
         self.canvas_gantt.draw()
         self._ultimo_gantt = time.perf_counter()
+
+    def _mostrar_comparacao_sync(self, resultados):
+        eixos = list(self.eixos_sync.flat)
+        for eixo in eixos:
+            eixo.clear()
+
+        if resultados:
+            nomes = []
+            for resultado in resultados:
+                config = resultado["config"]
+                if config.modo_sincronizador == "semaforo":
+                    nomes.append(f"Semáforo({config.capacidade_semaforo})")
+                else:
+                    nomes.append(config.modo_sincronizador.capitalize())
+            x = list(range(len(resultados)))
+
+            for eixo, titulo, chave, ylabel in [
+                    (eixos[0], "Atualizações perdidas",
+                     "atualizacoes_perdidas", "Quantidade"),
+                    (eixos[1], "Bloqueios", "bloqueios", "Quantidade"),
+                    (eixos[3], "Throughput", "throughput", "Leituras/s")]:
+                eixo.bar(x, [r[chave] for r in resultados])
+                eixo.set_title(titulo)
+                eixo.set_ylabel(ylabel)
+                eixo.set_xticks(x, nomes, rotation=15)
+                eixo.grid(True, axis="y", alpha=0.3)
+
+            largura = 0.36
+            eixos[2].bar([i - largura / 2 for i in x],
+                         [r["tempo_espera"] for r in resultados],
+                         width=largura, label="Espera sincronização")
+            eixos[2].bar([i + largura / 2 for i in x],
+                         [r["tempo_total"] for r in resultados],
+                         width=largura, label="Tempo total")
+            eixos[2].set_title("Tempos")
+            eixos[2].set_ylabel("Segundos")
+            eixos[2].set_xticks(x, nomes, rotation=15)
+            eixos[2].legend(fontsize=7)
+            eixos[2].grid(True, axis="y", alpha=0.3)
+        else:
+            for eixo, titulo in zip(eixos, [
+                    "Atualizações perdidas", "Bloqueios", "Tempos",
+                    "Throughput"]):
+                eixo.set_title(titulo)
+                eixo.grid(True, axis="y", alpha=0.3)
+
+        self.figura_sync.suptitle("Comparação dos modos de sincronização")
+        self.figura_sync.tight_layout()
+        self.canvas_sync.draw()
 
     def _mostrar_resultado(self, r):
         self._limpar_tabela(self.tree_resultados)
