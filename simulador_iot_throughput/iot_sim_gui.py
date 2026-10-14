@@ -16,6 +16,26 @@ from contextlib import closing
 import sqlite3
 
 SENTINELA = object()
+MAX_LOG = 500
+MAX_GANTT = 500
+
+
+class Registrador:
+    def __init__(self, callback=None):
+        self.callback = callback
+        self.t0 = time.perf_counter()
+
+    def agora(self):
+        return time.perf_counter() - self.t0
+
+    def log(self, mensagem):
+        if self.callback is not None:
+            texto = f"[{threading.current_thread().name}] {mensagem}"
+            self.callback(("log", f"{self.agora():7.3f}s {texto}"))
+
+    def evento(self, tipo, dados):
+        if self.callback is not None:
+            self.callback((tipo, dados))
 
 @dataclass
 class Configuracao:
@@ -112,8 +132,9 @@ class Database:
 
 
 class Sincronizador:
-    def __init__(self, modo="mutex", n_semaf=1):
+    def __init__(self, modo="mutex", n_semaf=1, registrador=None):
         self.modo = modo
+        self.registrador = registrador
         if modo == "mutex":
             self.recurso = threading.Lock()
         elif modo == "semaforo":
@@ -129,17 +150,34 @@ class Sincronizador:
         self.tempo_espera = 0.0
 
     def adquirir(self):
+        nome = threading.current_thread().name
         if self.recurso is None:
+            if self.registrador:
+                self.registrador.evento("sc", {
+                    "estado": "entrou", "thread": nome,
+                    "tempo": self.registrador.agora()})
             return
         inicio = time.perf_counter()
         if not self.recurso.acquire(blocking=False):
             print(f"[{threading.current_thread().name}] BLOQUEADA")
+            if self.registrador:
+                self.registrador.evento("sc", {
+                    "estado": "bloqueada", "thread": nome,
+                    "tempo": self.registrador.agora()})
             self.recurso.acquire()
             with self.lock_metricas:
                 self.bloqueios += 1
                 self.tempo_espera += time.perf_counter() - inicio
+        if self.registrador:
+            self.registrador.evento("sc", {
+                "estado": "entrou", "thread": nome,
+                "tempo": self.registrador.agora()})
 
     def liberar(self):
+        if self.registrador:
+            self.registrador.evento("sc", {
+                "estado": "saiu", "thread": threading.current_thread().name,
+                "tempo": self.registrador.agora()})
         if self.recurso is not None:
             self.recurso.release()
 
@@ -161,11 +199,13 @@ class ContadorCompartilhado:
 
 
 class IotSensor:
-    def __init__(self, sensor_id, banco, sincronizador, contador):
+    def __init__(self, sensor_id, banco, sincronizador, contador,
+                 registrador=None):
         self.sensor_id = sensor_id
         self.banco = banco
         self.sincronizador = sincronizador
         self.contador = contador
+        self.registrador = registrador
 
     def gera_medida(self):
         return {"sensor_id": self.sensor_id,
@@ -180,10 +220,14 @@ class IotSensor:
                       else self.gera_medida())
             if medidas_fixas is not None:
                 medida["horario"] = time.time()
+            if self.registrador:
+                self.registrador.log("tentando acessar o banco")
             self.sincronizador.adquirir()
             try:
                 self.banco.gravacao(medida)
                 self.contador.incrementar()
+                if self.registrador:
+                    self.registrador.log("gravou leitura")
             finally:
                 self.sincronizador.liberar()
             if stop_event.wait(intervalo):
@@ -213,13 +257,14 @@ class ColetorResultados:
 
 class Servidor:
     def __init__(self, servidor_id, fila, banco, tempo_processamento,
-                 coletor, stop_event):
+                 coletor, stop_event, registrador=None):
         self.servidor_id = servidor_id
         self.fila = fila
         self.banco = banco
         self.tempo_processamento = tempo_processamento
         self.coletor = coletor
         self.stop_event = stop_event
+        self.registrador = registrador
 
     def run(self):
         while True:
@@ -230,14 +275,18 @@ class Servidor:
                 if leitura is SENTINELA:
                     return
                 leitura_id = leitura["leitura_id"]
+                if self.registrador:
+                    self.registrador.evento("ready", {
+                        "acao": "remover", "pid": leitura_id})
                 inicio_processamento = time.perf_counter()
                 # na_fila -> processando: só agora o servidor realmente trabalha.
                 if not self.banco.iniciar_processamento(leitura_id):
                     continue
+                inicio_exec = (self.registrador.agora()
+                               if self.registrador else 0.0)
                 if self.stop_event.wait(self.tempo_processamento):
                     self.banco.devolver_leitura(leitura_id)
-                    continue
-                if self.banco.concluir_leitura(leitura_id):
+                elif self.banco.concluir_leitura(leitura_id):
                     resultado = dict(leitura)
                     resultado["espera_processamento"] = max(
                         0.0, inicio_processamento - leitura["enfileirado_em"])
@@ -245,11 +294,19 @@ class Servidor:
                     resultado["servidor_id"] = self.servidor_id
                     resultado["thread_servidor"] = threading.current_thread().name
                     self.coletor.adicionar(resultado)
+                if self.registrador:
+                    self.registrador.evento("gantt", {
+                        "pid": leitura_id,
+                        "cpu": threading.current_thread().name,
+                        "sensor": leitura["sensor_id"],
+                        "inicio": inicio_exec,
+                        "fim": self.registrador.agora()})
             finally:
                 self.fila.task_done()
 
 
-def despachar_pendentes(banco, fila, stop_event, fim_produtores, algoritmo="FCFS"):
+def despachar_pendentes(banco, fila, stop_event, fim_produtores, algoritmo="FCFS",
+                        registrador=None):
     # FCFS: ordem de chegada; Prioridade: menor número primeiro.
     while not stop_event.is_set():
         pendentes = banco.buscar_pendentes(limite=20)
@@ -258,6 +315,12 @@ def despachar_pendentes(banco, fila, stop_event, fim_produtores, algoritmo="FCFS
                 break
             if banco.reservar_leitura(leitura["leitura_id"]):
                 leitura["enfileirado_em"] = time.perf_counter()
+                if registrador:
+                    registrador.evento("ready", {
+                        "acao": "adicionar", "pid": leitura["leitura_id"],
+                        "sensor": leitura["sensor_id"],
+                        "prioridade": leitura["prioridade"],
+                        "algoritmo": algoritmo})
                 if algoritmo == "Prioridade":
                     fila.put((leitura["prioridade"], leitura["leitura_id"], leitura))
                 else:
@@ -273,14 +336,15 @@ def dividir_trabalho(total, quantidade_threads):
 
 
 def executar_simulacao(config, stop_event=None, guardar_leituras=True,
-                       callback_estados=None, carga=None):
+                       callback_estados=None, carga=None, callback_eventos=None):
     stop_event = stop_event if stop_event is not None else threading.Event()
     banco = Database()
     banco.reiniciar()
     fila = PriorityQueue() if config.algoritmo == "Prioridade" else Queue()
+    registrador = Registrador(callback_eventos)
     fim_produtores = threading.Event()
     sincronizador = Sincronizador(config.modo_sincronizador,
-                                  config.capacidade_semaforo)
+                                  config.capacidade_semaforo, registrador)
     contador = ContadorCompartilhado()
     coletor = ColetorResultados(guardar_leituras)
     total_esperado = config.num_sensores * config.leituras_por_sensor
@@ -300,14 +364,14 @@ def executar_simulacao(config, stop_event=None, guardar_leituras=True,
     threads_servidores = []
     for servidor_id in range(config.num_servidores):
         servidor = Servidor(servidor_id, fila, banco, config.tempo_processamento,
-                            coletor, stop_event)
+                            coletor, stop_event, registrador)
         for i in range(config.threads_por_servidor):
             threads_servidores.append(threading.Thread(
                 target=servidor.run, name=f"Servidor-{servidor_id}-Thread-{i}"))
 
     threads_sensores = []
     for sensor_id in range(config.num_sensores):
-        sensor = IotSensor(sensor_id, banco, sincronizador, contador)
+        sensor = IotSensor(sensor_id, banco, sincronizador, contador, registrador)
         medidas = carga[sensor_id] if carga is not None else None
         inicio_fatia = 0
         for i, quantidade in enumerate(dividir_trabalho(
@@ -326,7 +390,8 @@ def executar_simulacao(config, stop_event=None, guardar_leituras=True,
         thread.start()
     despachante = threading.Thread(
         target=despachar_pendentes,
-        args=(banco, fila, stop_event, fim_produtores, config.algoritmo),
+        args=(banco, fila, stop_event, fim_produtores, config.algoritmo,
+              registrador),
         name="Despachante")
     despachante.start()
     for thread in threads_sensores:
@@ -349,6 +414,7 @@ def executar_simulacao(config, stop_event=None, guardar_leituras=True,
     if monitor:
         monitor.join()
         callback_estados(banco.contagem_status())  # estado final na tela
+    registrador.evento("ready", {"acao": "limpar"})
     estados = banco.contagem_status()
     gravadas = sum(estados.values())
     metricas = sincronizador.obter_metricas()
@@ -384,6 +450,15 @@ class Aplicacao(tk.Tk):
         self.fila_ui = Queue()
         self.em_execucao = False
         self.variaveis = {}
+        self.sc_dentro = set()
+        self.sc_aguardando = set()
+        self.ready = {}
+        self.ready_algoritmo = "FCFS"
+        self._ready_suja = False
+        self.gantt_individual = []
+        self.gantt_comparacao = {"FCFS": [], "Prioridade": []}
+        self._gantt_sujo = False
+        self._ultimo_gantt = 0.0
         self._criar_interface()
         self.after(100, self._processar_fila_ui)
 
@@ -445,10 +520,6 @@ class Aplicacao(tk.Tk):
                                         command=self._gerar_grafico)
         self.botao_grafico.grid(row=linha, column=0, columnspan=2, sticky="ew", pady=4)
         linha += 1
-        self.botao_comparar = ttk.Button(painel, text="Comparar FCFS x Prioridade",
-                                         command=self._comparar_algoritmos)
-        self.botao_comparar.grid(row=linha, column=0, columnspan=2, sticky="ew", pady=4)
-        linha += 1
         self.botao_cancelar = ttk.Button(painel, text="Cancelar", state="disabled",
                                          command=self._cancelar)
         self.botao_cancelar.grid(row=linha, column=0, columnspan=2, sticky="ew", pady=4)
@@ -500,6 +571,56 @@ class Aplicacao(tk.Tk):
             ("horario", "Horário", 135), ("prioridade", "Prioridade", 80),
             ("servidor", "Servidor", 75), ("thread", "Thread", 190),
             ("status", "Status", 100), ("espera", "Espera fila (s)", 110)])
+
+        aba_sc = ttk.Frame(abas, padding=6)
+        abas.add(aba_sc, text="Seção crítica / Log")
+        self.var_sc_dentro = tk.StringVar(value="Nenhuma")
+        self.var_sc_aguardando = tk.StringVar(value="Nenhuma")
+        ttk.Label(aba_sc, text="Dentro da seção crítica:").pack(anchor="w")
+        ttk.Label(aba_sc, textvariable=self.var_sc_dentro,
+                  wraplength=780).pack(anchor="w", pady=(0, 4))
+        ttk.Label(aba_sc, text="Aguardando mutex/semáforo:").pack(anchor="w")
+        ttk.Label(aba_sc, textvariable=self.var_sc_aguardando,
+                  wraplength=780).pack(anchor="w", pady=(0, 4))
+        ttk.Label(aba_sc, text=(
+            "A corrida demonstrativa ocorre no ContadorCompartilhado; "
+            "o SQLite mantém seu próprio controle transacional."),
+            wraplength=780).pack(anchor="w", pady=(0, 6))
+        frame_log = ttk.Frame(aba_sc)
+        frame_log.pack(fill="both", expand=True)
+        self.text_log = tk.Text(frame_log, height=12, state="disabled",
+                                wrap="none", font="TkFixedFont")
+        scroll_log = ttk.Scrollbar(frame_log, orient="vertical",
+                                   command=self.text_log.yview)
+        self.text_log.configure(yscrollcommand=scroll_log.set)
+        self.text_log.pack(side="left", fill="both", expand=True)
+        scroll_log.pack(side="right", fill="y")
+
+        aba_ready = ttk.Frame(abas)
+        abas.add(aba_ready, text="Ready Queue")
+        self.tree_ready = self._criar_tabela(aba_ready, [
+            ("posicao", "Posição", 80), ("pid", "PID", 100),
+            ("sensor", "Sensor", 100), ("prioridade", "Prioridade", 100)])
+
+        aba_gantt = ttk.Frame(abas, padding=4)
+        abas.add(aba_gantt, text="Gantt (CPU)")
+        topo_gantt = ttk.Frame(aba_gantt)
+        topo_gantt.pack(fill="x")
+        ttk.Label(topo_gantt, text="Visualização:").pack(side="left")
+        self.var_gantt = tk.StringVar(value="Execução individual")
+        seletor_gantt = ttk.Combobox(
+            topo_gantt, textvariable=self.var_gantt, state="readonly", width=32,
+            values=["Execução individual", "Comparação FCFS × Prioridade"])
+        seletor_gantt.pack(side="left", padx=6)
+        seletor_gantt.bind("<<ComboboxSelected>>", self._selecionar_gantt)
+        ttk.Label(topo_gantt,
+                  text="Servidores/threads são unidades de processamento simuladas.").pack(
+                      side="left", padx=8)
+        self.figura_gantt = Figure(figsize=(7, 4), dpi=100)
+        self.eixo_gantt = self.figura_gantt.add_subplot(111)
+        self.canvas_gantt = FigureCanvasTkAgg(self.figura_gantt, master=aba_gantt)
+        self.canvas_gantt.get_tk_widget().pack(fill="both", expand=True)
+        self._desenhar_gantt()
 
         # Painel de estados ao vivo (atualizado pelo monitor durante a execução).
         frame_estados = ttk.LabelFrame(direita, text="Estados ao vivo", padding=6)
@@ -553,7 +674,6 @@ class Aplicacao(tk.Tk):
         self.em_execucao = ativo
         self.botao_executar.configure(state="disabled" if ativo else "normal")
         self.botao_grafico.configure(state="disabled" if ativo else "normal")
-        self.botao_comparar.configure(state="disabled" if ativo else "normal")
         self.botao_cancelar.configure(state="normal" if ativo else "disabled")
         if ativo:
             self.progresso.start(10)
@@ -573,6 +693,7 @@ class Aplicacao(tk.Tk):
         except ValueError as erro:
             messagebox.showerror("Configuração inválida", str(erro))
             return
+        self._limpar_visuais_execucao(config.algoritmo)
         self.var_status.set("Executando configuração...")
         self._iniciar(self._worker_configuracao, (config,))
 
@@ -580,8 +701,15 @@ class Aplicacao(tk.Tk):
         try:
             resultado = executar_simulacao(
                 config, self.stop_event, True,
-                callback_estados=lambda e: self.fila_ui.put(("estados", e)))
+                callback_estados=lambda e: self.fila_ui.put(("estados", e)),
+                callback_eventos=self.fila_ui.put)
             self.fila_ui.put(("resultado", resultado))
+            if self.stop_event.is_set():
+                self.fila_ui.put(("comparacao", []))
+            else:
+                # A comparação clássica usa um único worker nos dois algoritmos.
+                self._worker_comparacao(replace(
+                    config, num_servidores=1, threads_por_servidor=1))
         except Exception as erro:
             self.fila_ui.put(("erro", str(erro)))
 
@@ -643,8 +771,12 @@ class Aplicacao(tk.Tk):
                 if self.stop_event.is_set():
                     break
                 self.fila_ui.put(("status", f"Testando {algoritmo}..."))
+                def evento_comparacao(evento, nome=algoritmo):
+                    if evento[0] == "gantt":
+                        self.fila_ui.put(("gantt_comparacao", (nome, evento[1])))
                 resultado = executar_simulacao(replace(config, algoritmo=algoritmo),
-                                              self.stop_event, False, carga=carga)
+                                              self.stop_event, False, carga=carga,
+                                              callback_eventos=evento_comparacao)
                 resultados.append(resultado)
             self.fila_ui.put(("comparacao", resultados))
         except Exception as erro:
@@ -660,9 +792,8 @@ class Aplicacao(tk.Tk):
                 tipo, payload = self.fila_ui.get_nowait()
                 if tipo == "resultado":
                     self._mostrar_resultado(payload)
-                    self._set_em_execucao(False)
-                    self.var_status.set("Cancelada." if payload["cancelado"]
-                                        else "Configuração concluída.")
+                    self.var_status.set("Cancelamento em andamento..." if payload["cancelado"]
+                                        else "Configuração concluída; comparando algoritmos...")
                 elif tipo == "ponto":
                     self.tree_curva.insert("", "end", values=(
                         payload["valor"], payload["threads_servidor_totais"],
@@ -677,11 +808,30 @@ class Aplicacao(tk.Tk):
                                         else "Gráfico concluído.")
                 elif tipo == "comparacao":
                     self._mostrar_comparacao(payload)
+                    if payload:
+                        self.var_gantt.set("Comparação FCFS × Prioridade")
+                        self._desenhar_gantt()
+                        self._gantt_sujo = False
                     self._set_em_execucao(False)
                     self.var_status.set("Comparação concluída." if len(payload) == 2
                                         and not self.stop_event.is_set() else "Interrompida.")
                 elif tipo == "estados":
                     self._atualizar_estados(payload)
+                elif tipo == "log":
+                    self._adicionar_log(payload)
+                elif tipo == "sc":
+                    self._atualizar_sc_evento(payload)
+                elif tipo == "ready":
+                    self._atualizar_ready(payload)
+                elif tipo == "gantt":
+                    self.gantt_individual.append(payload)
+                    del self.gantt_individual[:-MAX_GANTT]
+                    self._gantt_sujo = True
+                elif tipo == "gantt_comparacao":
+                    algoritmo, segmento = payload
+                    self.gantt_comparacao[algoritmo].append(segmento)
+                    del self.gantt_comparacao[algoritmo][:-MAX_GANTT]
+                    self._gantt_sujo = True
                 elif tipo == "status":
                     self.var_status.set(payload)
                 elif tipo == "erro":
@@ -691,11 +841,119 @@ class Aplicacao(tk.Tk):
                 self.fila_ui.task_done()
         except Empty:
             pass
+        if self._ready_suja:
+            self._desenhar_ready()
+        if (self._gantt_sujo and
+                time.perf_counter() - self._ultimo_gantt >= 0.25):
+            self._desenhar_gantt()
+            self._gantt_sujo = False
         self.after(100, self._processar_fila_ui)
 
     def _atualizar_estados(self, estados):
         for chave, var in self.var_estados.items():
             var.set(str(estados.get(chave, 0)))
+
+    def _limpar_visuais_execucao(self, algoritmo):
+        self.sc_dentro.clear()
+        self.sc_aguardando.clear()
+        self.var_sc_dentro.set("Nenhuma")
+        self.var_sc_aguardando.set("Nenhuma")
+        self.text_log.configure(state="normal")
+        self.text_log.delete("1.0", "end")
+        self.text_log.configure(state="disabled")
+        self.ready.clear()
+        self.ready_algoritmo = algoritmo
+        self._limpar_tabela(self.tree_ready)
+        self.gantt_individual.clear()
+        self.gantt_comparacao = {"FCFS": [], "Prioridade": []}
+        self.var_gantt.set("Execução individual")
+        self._desenhar_gantt()
+        self._atualizar_estados({})
+
+    def _adicionar_log(self, texto):
+        self.text_log.configure(state="normal")
+        linhas = int(self.text_log.index("end-1c").split(".")[0])
+        if linhas >= MAX_LOG:
+            self.text_log.delete("1.0", "2.0")
+        self.text_log.insert("end", texto + "\n")
+        self.text_log.see("end")
+        self.text_log.configure(state="disabled")
+
+    def _atualizar_sc_evento(self, evento):
+        estado, nome = evento["estado"], evento["thread"]
+        if estado == "bloqueada":
+            self.sc_aguardando.add(nome)
+        elif estado == "entrou":
+            self.sc_aguardando.discard(nome)
+            self.sc_dentro.add(nome)
+        elif estado == "saiu":
+            self.sc_dentro.discard(nome)
+        self.var_sc_dentro.set(", ".join(sorted(self.sc_dentro)) or "Nenhuma")
+        self.var_sc_aguardando.set(", ".join(sorted(self.sc_aguardando)) or "Nenhuma")
+        mensagens = {"bloqueada": "BLOQUEADA", "entrou": "entrou na seção crítica",
+                     "saiu": "saiu da seção crítica"}
+        self._adicionar_log(
+            f'{evento["tempo"]:7.3f}s [{nome}] {mensagens[estado]}')
+
+    def _atualizar_ready(self, evento):
+        acao = evento["acao"]
+        if acao == "adicionar":
+            self.ready[evento["pid"]] = evento
+            self.ready_algoritmo = evento["algoritmo"]
+        elif acao == "remover":
+            self.ready.pop(evento["pid"], None)
+        elif acao == "limpar":
+            self.ready.clear()
+        self._ready_suja = True
+
+    def _desenhar_ready(self):
+        self._limpar_tabela(self.tree_ready)
+        itens = list(self.ready.values())
+        if self.ready_algoritmo == "Prioridade":
+            itens.sort(key=lambda item: (item["prioridade"], item["pid"]))
+        for posicao, item in enumerate(itens, 1):
+            self.tree_ready.insert("", "end", values=(
+                posicao, item["pid"], item["sensor"], item["prioridade"]))
+        self._ready_suja = False
+
+    def _selecionar_gantt(self, _evento=None):
+        self._desenhar_gantt()
+
+    def _desenhar_gantt(self):
+        comparacao = self.var_gantt.get().startswith("Comparação")
+        if comparacao:
+            segmentos = [dict(s, cpu=f"{algoritmo} · {s['cpu']}")
+                         for algoritmo in ("FCFS", "Prioridade")
+                         for s in self.gantt_comparacao[algoritmo]]
+        else:
+            segmentos = self.gantt_individual
+        eixo = self.eixo_gantt
+        eixo.clear()
+        titulo = ("Gantt da comparação (1 worker por algoritmo)" if comparacao
+                  else "Gantt da execução individual")
+        eixo.set_title(titulo)
+        eixo.set_xlabel("Tempo desde o início da simulação (s)")
+        eixo.set_ylabel("Thread de servidor (unidade simulada)")
+        if segmentos:
+            cpus = list(dict.fromkeys(s["cpu"] for s in segmentos))
+            linha = {cpu: indice * 10 for indice, cpu in enumerate(cpus)}
+            fim_maximo = max(s["fim"] for s in segmentos)
+            for segmento in segmentos:
+                duracao = max(0.0, segmento["fim"] - segmento["inicio"])
+                y = linha[segmento["cpu"]]
+                eixo.broken_barh([(segmento["inicio"], duracao)], (y, 8),
+                                  facecolors=f'C{segmento["sensor"] % 10}',
+                                  edgecolors="black", linewidth=0.3)
+                if duracao >= max(0.01, fim_maximo * 0.04):
+                    eixo.text(segmento["inicio"] + duracao / 2, y + 4,
+                              str(segmento["pid"]), ha="center", va="center",
+                              fontsize=7)
+            eixo.set_yticks([linha[cpu] + 4 for cpu in cpus], cpus)
+            eixo.set_ylim(0, len(cpus) * 10)
+            eixo.grid(True, axis="x", alpha=0.3)
+        self.figura_gantt.tight_layout()
+        self.canvas_gantt.draw()
+        self._ultimo_gantt = time.perf_counter()
 
     def _mostrar_resultado(self, r):
         self._limpar_tabela(self.tree_resultados)
