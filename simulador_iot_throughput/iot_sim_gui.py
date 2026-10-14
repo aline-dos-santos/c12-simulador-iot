@@ -1,7 +1,7 @@
 import random
 import time
 import threading
-from queue import Queue, Empty
+from queue import Queue, PriorityQueue, Empty
 from dataclasses import dataclass, replace
 from datetime import datetime
 
@@ -28,6 +28,7 @@ class Configuracao:
     threads_por_servidor: int
     modo_sincronizador: str = "mutex"
     capacidade_semaforo: int = 1
+    algoritmo: str = "FCFS"
 
 
 class Database:
@@ -171,11 +172,14 @@ class IotSensor:
                 "temperatura": random.uniform(15, 35),
                 "horario": time.time(), "prioridade": random.randint(1, 3)}
 
-    def leitura(self, quantidade, intervalo, stop_event):
-        for _ in range(quantidade):
+    def leitura(self, quantidade, intervalo, stop_event, medidas_fixas=None):
+        for indice in range(quantidade):
             if stop_event.is_set():
                 break
-            medida = self.gera_medida()
+            medida = (dict(medidas_fixas[indice]) if medidas_fixas is not None
+                      else self.gera_medida())
+            if medidas_fixas is not None:
+                medida["horario"] = time.time()
             self.sincronizador.adquirir()
             try:
                 self.banco.gravacao(medida)
@@ -191,11 +195,18 @@ class ColetorResultados:
         self.guardar_leituras = guardar_leituras
         self.resultados = []
         self.total = 0
+        self.espera_total = 0.0
+        self.esperas_prioridade = {1: [0.0, 0], 2: [0.0, 0], 3: [0.0, 0]}
         self.lock = threading.Lock()
 
     def adicionar(self, leitura):
         with self.lock:
             self.total += 1
+            espera = leitura["espera_processamento"]
+            self.espera_total += espera
+            grupo = self.esperas_prioridade[leitura["prioridade"]]
+            grupo[0] += espera
+            grupo[1] += 1
             if self.guardar_leituras:
                 self.resultados.append(leitura)
 
@@ -214,9 +225,12 @@ class Servidor:
         while True:
             leitura = self.fila.get()
             try:
+                if isinstance(leitura, tuple):  # PriorityQueue: prioridade, id, leitura
+                    leitura = leitura[2]
                 if leitura is SENTINELA:
                     return
                 leitura_id = leitura["leitura_id"]
+                inicio_processamento = time.perf_counter()
                 # na_fila -> processando: só agora o servidor realmente trabalha.
                 if not self.banco.iniciar_processamento(leitura_id):
                     continue
@@ -225,6 +239,8 @@ class Servidor:
                     continue
                 if self.banco.concluir_leitura(leitura_id):
                     resultado = dict(leitura)
+                    resultado["espera_processamento"] = max(
+                        0.0, inicio_processamento - leitura["enfileirado_em"])
                     resultado["status"] = "concluido"
                     resultado["servidor_id"] = self.servidor_id
                     resultado["thread_servidor"] = threading.current_thread().name
@@ -233,15 +249,19 @@ class Servidor:
                 self.fila.task_done()
 
 
-def despachar_pendentes(banco, fila, stop_event, fim_produtores):
-    # Ponte entre produtores e futuro scheduler; seleção FCFS provisória.
+def despachar_pendentes(banco, fila, stop_event, fim_produtores, algoritmo="FCFS"):
+    # FCFS: ordem de chegada; Prioridade: menor número primeiro.
     while not stop_event.is_set():
         pendentes = banco.buscar_pendentes(limite=20)
         for leitura in pendentes:
             if stop_event.is_set():
                 break
             if banco.reservar_leitura(leitura["leitura_id"]):
-                fila.put(leitura)
+                leitura["enfileirado_em"] = time.perf_counter()
+                if algoritmo == "Prioridade":
+                    fila.put((leitura["prioridade"], leitura["leitura_id"], leitura))
+                else:
+                    fila.put(leitura)
         if fim_produtores.is_set() and not banco.buscar_pendentes(limite=1):
             break
         stop_event.wait(0.05)
@@ -253,11 +273,11 @@ def dividir_trabalho(total, quantidade_threads):
 
 
 def executar_simulacao(config, stop_event=None, guardar_leituras=True,
-                       callback_estados=None):
+                       callback_estados=None, carga=None):
     stop_event = stop_event if stop_event is not None else threading.Event()
     banco = Database()
     banco.reiniciar()
-    fila = Queue()
+    fila = PriorityQueue() if config.algoritmo == "Prioridade" else Queue()
     fim_produtores = threading.Event()
     sincronizador = Sincronizador(config.modo_sincronizador,
                                   config.capacidade_semaforo)
@@ -288,11 +308,15 @@ def executar_simulacao(config, stop_event=None, guardar_leituras=True,
     threads_sensores = []
     for sensor_id in range(config.num_sensores):
         sensor = IotSensor(sensor_id, banco, sincronizador, contador)
+        medidas = carga[sensor_id] if carga is not None else None
+        inicio_fatia = 0
         for i, quantidade in enumerate(dividir_trabalho(
                 config.leituras_por_sensor, config.threads_por_sensor)):
+            parte = medidas[inicio_fatia:inicio_fatia + quantidade] if medidas is not None else None
+            inicio_fatia += quantidade
             threads_sensores.append(threading.Thread(
                 target=sensor.leitura,
-                args=(quantidade, config.intervalo_leituras, stop_event),
+                args=(quantidade, config.intervalo_leituras, stop_event, parte),
                 name=f"Sensor-{sensor_id}-Thread-{i}"))
 
     inicio = time.perf_counter()
@@ -302,7 +326,8 @@ def executar_simulacao(config, stop_event=None, guardar_leituras=True,
         thread.start()
     despachante = threading.Thread(
         target=despachar_pendentes,
-        args=(banco, fila, stop_event, fim_produtores), name="Despachante")
+        args=(banco, fila, stop_event, fim_produtores, config.algoritmo),
+        name="Despachante")
     despachante.start()
     for thread in threads_sensores:
         thread.start()
@@ -312,7 +337,10 @@ def executar_simulacao(config, stop_event=None, guardar_leituras=True,
     fim_produtores.set()
     despachante.join()
     for _ in threads_servidores:
-        fila.put(SENTINELA)
+        if config.algoritmo == "Prioridade":
+            fila.put((float("inf"), float("inf"), SENTINELA))
+        else:
+            fila.put(SENTINELA)
     for thread in threads_servidores:
         thread.join()
 
@@ -338,6 +366,10 @@ def executar_simulacao(config, stop_event=None, guardar_leituras=True,
         "atualizacoes_perdidas": max(0, gravadas - contador.valor),
         "bloqueios": metricas["bloqueios"],
         "tempo_espera": metricas["tempo_espera"],
+        "espera_processamento_media": (coletor.espera_total / coletor.total
+                                        if coletor.total else 0.0),
+        "esperas_prioridade": {p: soma / n if n else 0.0
+                               for p, (soma, n) in coletor.esperas_prioridade.items()},
         "cancelado": stop_event.is_set(),
     }
 
@@ -389,6 +421,12 @@ class Aplicacao(tk.Tk):
         ttk.Entry(painel, textvariable=self.var_capacidade, width=14).grid(
             row=linha, column=1, sticky="ew")
         linha += 1
+        self.var_algoritmo = tk.StringVar(value="FCFS")
+        ttk.Label(painel, text="Escalonamento").grid(row=linha, column=0, sticky="w")
+        ttk.Combobox(painel, textvariable=self.var_algoritmo,
+                     values=["FCFS", "Prioridade"], state="readonly",
+                     width=14).grid(row=linha, column=1, sticky="ew")
+        linha += 1
         self.var_grafico = tk.StringVar(value="Threads por servidor")
         ttk.Label(painel, text="Variável do gráfico").grid(row=linha, column=0, sticky="w", pady=8)
         ttk.Combobox(painel, textvariable=self.var_grafico,
@@ -406,6 +444,10 @@ class Aplicacao(tk.Tk):
         self.botao_grafico = ttk.Button(painel, text="Gerar gráfico de linhas",
                                         command=self._gerar_grafico)
         self.botao_grafico.grid(row=linha, column=0, columnspan=2, sticky="ew", pady=4)
+        linha += 1
+        self.botao_comparar = ttk.Button(painel, text="Comparar FCFS x Prioridade",
+                                         command=self._comparar_algoritmos)
+        self.botao_comparar.grid(row=linha, column=0, columnspan=2, sticky="ew", pady=4)
         linha += 1
         self.botao_cancelar = ttk.Button(painel, text="Cancelar", state="disabled",
                                          command=self._cancelar)
@@ -457,7 +499,7 @@ class Aplicacao(tk.Tk):
             ("sensor", "Sensor", 65), ("temperatura", "Temperatura", 100),
             ("horario", "Horário", 135), ("prioridade", "Prioridade", 80),
             ("servidor", "Servidor", 75), ("thread", "Thread", 190),
-            ("status", "Status", 100)])
+            ("status", "Status", 100), ("espera", "Espera fila (s)", 110)])
 
         # Painel de estados ao vivo (atualizado pelo monitor durante a execução).
         frame_estados = ttk.LabelFrame(direita, text="Estados ao vivo", padding=6)
@@ -495,7 +537,8 @@ class Aplicacao(tk.Tk):
                 num_servidores=int(v["num_servidores"].get()),
                 threads_por_servidor=int(v["threads_por_servidor"].get()),
                 modo_sincronizador=self.var_sincronizacao.get(),
-                capacidade_semaforo=int(self.var_capacidade.get()))
+                capacidade_semaforo=int(self.var_capacidade.get()),
+                algoritmo=self.var_algoritmo.get())
         except ValueError as erro:
             raise ValueError("Preencha os campos com números válidos.") from erro
         for campo in ("num_sensores", "threads_por_sensor", "leituras_por_sensor",
@@ -510,6 +553,7 @@ class Aplicacao(tk.Tk):
         self.em_execucao = ativo
         self.botao_executar.configure(state="disabled" if ativo else "normal")
         self.botao_grafico.configure(state="disabled" if ativo else "normal")
+        self.botao_comparar.configure(state="disabled" if ativo else "normal")
         self.botao_cancelar.configure(state="normal" if ativo else "disabled")
         if ativo:
             self.progresso.start(10)
@@ -575,6 +619,37 @@ class Aplicacao(tk.Tk):
         except Exception as erro:
             self.fila_ui.put(("erro", str(erro)))
 
+    def _comparar_algoritmos(self):
+        try:
+            config = self._ler_configuracao()
+        except ValueError as erro:
+            messagebox.showerror("Configuração inválida", str(erro))
+            return
+        # Um servidor/uma thread simulam a escolha da próxima tarefa por uma CPU.
+        config = replace(config, num_servidores=1, threads_por_servidor=1)
+        self.var_status.set("Comparando FCFS e Prioridade (1 worker)...")
+        self._iniciar(self._worker_comparacao, (config,))
+
+    def _worker_comparacao(self, config):
+        try:
+            # Mesmas temperaturas e prioridades nas duas rodadas.
+            carga = {}
+            for sensor_id in range(config.num_sensores):
+                sensor = IotSensor(sensor_id, None, None, None)
+                carga[sensor_id] = [sensor.gera_medida()
+                                    for _ in range(config.leituras_por_sensor)]
+            resultados = []
+            for algoritmo in ("FCFS", "Prioridade"):
+                if self.stop_event.is_set():
+                    break
+                self.fila_ui.put(("status", f"Testando {algoritmo}..."))
+                resultado = executar_simulacao(replace(config, algoritmo=algoritmo),
+                                              self.stop_event, False, carga=carga)
+                resultados.append(resultado)
+            self.fila_ui.put(("comparacao", resultados))
+        except Exception as erro:
+            self.fila_ui.put(("erro", str(erro)))
+
     def _cancelar(self):
         self.stop_event.set()
         self.var_status.set("Cancelamento solicitado...")
@@ -600,6 +675,11 @@ class Aplicacao(tk.Tk):
                     self._set_em_execucao(False)
                     self.var_status.set("Curva interrompida." if cancelado
                                         else "Gráfico concluído.")
+                elif tipo == "comparacao":
+                    self._mostrar_comparacao(payload)
+                    self._set_em_execucao(False)
+                    self.var_status.set("Comparação concluída." if len(payload) == 2
+                                        and not self.stop_event.is_set() else "Interrompida.")
                 elif tipo == "estados":
                     self._atualizar_estados(payload)
                 elif tipo == "status":
@@ -622,6 +702,8 @@ class Aplicacao(tk.Tk):
         itens = [
             ("Sensores", r["config"].num_sensores),
             ("Modo de sincronização", r["config"].modo_sincronizador),
+            ("Algoritmo", r["config"].algoritmo),
+            ("Espera média na fila", f'{r["espera_processamento_media"]:.4f} s'),
             ("Threads de sensores", r["total_threads_sensores"]),
             ("Threads de servidores", r["total_threads_servidor"]),
             ("Leituras esperadas", r["total_esperado"]),
@@ -648,7 +730,8 @@ class Aplicacao(tk.Tk):
             self.tree_leituras.insert("", "end", values=(
                 leitura["sensor_id"], f'{leitura["temperatura"]:.2f} °C',
                 horario, leitura["prioridade"], leitura["servidor_id"],
-                leitura["thread_servidor"], leitura["status"]))
+                leitura["thread_servidor"], leitura["status"],
+                f'{leitura["espera_processamento"]:.4f}'))
 
     def _mostrar_grafico(self, variavel, pontos):
         for indice, chave in enumerate(("tempo_total", "throughput")):
@@ -665,6 +748,32 @@ class Aplicacao(tk.Tk):
             eixo.grid(True, alpha=0.3)
             figura.tight_layout()
             canvas.draw()
+
+    def _mostrar_comparacao(self, resultados):
+        if not resultados:
+            return
+        nomes = [r["config"].algoritmo for r in resultados]
+        espera = [r["espera_processamento_media"] for r in resultados]
+        prioridade1 = [r["esperas_prioridade"][1] for r in resultados]
+        eixo, figura, canvas = self.figuras[0]
+        eixo.clear()
+        x = range(len(resultados))
+        eixo.bar([i - 0.17 for i in x], espera, width=0.34, label="Média geral")
+        eixo.bar([i + 0.17 for i in x], prioridade1, width=0.34,
+                 label="Prioridade 1")
+        eixo.set_xticks(list(x), nomes)
+        eixo.set_ylabel("Espera na fila (s)")
+        eixo.set_title("Comparação: FCFS x Prioridade")
+        eixo.legend()
+        figura.tight_layout()
+        canvas.draw()
+        eixo, figura, canvas = self.figuras[1]
+        eixo.clear()
+        eixo.bar(nomes, [r["throughput"] for r in resultados])
+        eixo.set_ylabel("Leituras/s")
+        eixo.set_title("Vazão: FCFS x Prioridade")
+        figura.tight_layout()
+        canvas.draw()
 
     @staticmethod
     def _limpar_tabela(tree):
